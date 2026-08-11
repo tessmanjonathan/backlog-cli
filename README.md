@@ -42,8 +42,26 @@ bl decay --amount 25   # run daily / on schedule
 | `bl show <id> [--json]` | One card |
 | `bl note <id> "text"` | Append to notes |
 | `bl decay [-a 25]` | Subtract priority from all non-done cards |
+| `bl serve [-p 7788] [--also other.db] [--open]` | Read-only board view on localhost |
 
 Env / flag: `BL_DB` or `--db path` overrides the database location (default `./backlog.db`).
+
+## Board view
+
+```bash
+bl serve --open                                   # board for ./backlog.db on :7788
+bl --db ~/git/foo/backlog.db serve \
+   --also ~/git/bar/backlog.db --port 9000        # switch between projects in the UI
+```
+
+Serves a dashboard at `http://127.0.0.1:7788` — summary tiles, open cards by label,
+priority distribution, and a `new / ready / in_progress / done` board. Click a card for
+notes, outcome, claim and timestamps; `#card-12` in the URL deep-links to one card.
+Polls every 5s, so an agent loop's progress shows up live.
+
+Read-only by design: the databases are opened `SQLITE_OPEN_READ_ONLY`, only the paths
+given on the command line are reachable, and the listener binds `127.0.0.1` only. Use the
+CLI to make changes.
 
 ## Suggested agent flow
 

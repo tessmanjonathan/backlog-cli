@@ -1,3 +1,5 @@
+mod serve;
+
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -159,6 +161,18 @@ enum Commands {
         text: String,
     },
 
+    /// Serve a read-only board view of the backlog on localhost
+    Serve {
+        #[arg(short, long, default_value_t = 7788)]
+        port: u16,
+        /// Additional database(s) to make selectable in the board
+        #[arg(long = "also", value_name = "PATH")]
+        also: Vec<PathBuf>,
+        /// Open the board in the default browser
+        #[arg(long)]
+        open: bool,
+    },
+
     /// Decrement priority of all non-done cards (decay)
     Decay {
         #[arg(short, long, default_value_t = 25)]
@@ -317,6 +331,19 @@ fn print_card(c: &Card, json: bool) {
             println!("    claimed_at: {}", c.claimed_at);
         }
         println!("    created: {}   updated: {}", c.created_at, c.updated_at);
+    }
+}
+
+/// Short human label for a database: `<parent dir>/<file>` when we can get it.
+fn source_label(path: &Path) -> String {
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let file = abs
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| abs.display().to_string());
+    match abs.parent().and_then(|p| p.file_name()) {
+        Some(dir) => format!("{}/{}", dir.to_string_lossy(), file),
+        None => file,
     }
 }
 
@@ -722,6 +749,25 @@ fn main() -> Result<()> {
                 params![new_notes, now, id],
             )?;
             println!("#{} note appended", id);
+        }
+
+        Commands::Serve { port, also, open } => {
+            // Ensure the primary DB exists and is current before anyone looks at it.
+            let conn = open_db(&path)?;
+            ensure_schema(&conn)?;
+            drop(conn);
+
+            let mut sources = vec![serve::Source {
+                label: source_label(&path),
+                path: path.clone(),
+            }];
+            for p in also {
+                sources.push(serve::Source {
+                    label: source_label(&p),
+                    path: p,
+                });
+            }
+            serve::run(sources, port, open)?;
         }
 
         Commands::Decay { amount } => {
