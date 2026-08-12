@@ -161,9 +161,36 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) 
 /// server and no network needed to open it.
 pub fn export(sources: Vec<Source>, out: &Path) -> Result<()> {
     check_sources(&sources)?;
+    let total = write_snapshot(&sources[0], out)?;
 
-    // A snapshot holds one database — there is nothing to switch between.
-    let feed = feed(&sources[..1], 0)?;
+    println!(
+        "wrote {} ({} card{}, {:.0} KB)",
+        out.display(),
+        total,
+        if total == 1 { "" } else { "s" },
+        std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) as f64 / 1024.0
+    );
+    if sources.len() > 1 {
+        eprintln!("note: a snapshot holds one database; ignored the extra --also path(s)");
+    }
+    Ok(())
+}
+
+/// Rewrite an existing snapshot from the database, silently. This is what
+/// makes the static file behave like a live view: every command that writes a
+/// card calls it, so opening (or reloading) the HTML always shows the truth.
+pub fn refresh(db: &Path, out: &Path) -> Result<()> {
+    let source = Source {
+        label: db.display().to_string(),
+        path: db.to_path_buf(),
+    };
+    write_snapshot(&source, out)?;
+    Ok(())
+}
+
+/// Bakes one database's cards into the dashboard template. Returns the card count.
+fn write_snapshot(source: &Source, out: &Path) -> Result<usize> {
+    let feed = feed(std::slice::from_ref(source), 0)?;
     let total = feed.cards.len();
 
     // `<` can't appear raw inside the data block or a card's text could close
@@ -181,19 +208,14 @@ pub fn export(sources: Vec<Source>, out: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
     }
-    std::fs::write(out, page).with_context(|| format!("failed to write {}", out.display()))?;
+    // Write beside the target and rename, so a reader never sees a half-written
+    // page when a refresh lands while the browser is loading it.
+    let tmp = out.with_extension("html.tmp");
+    std::fs::write(&tmp, page).with_context(|| format!("failed to write {}", tmp.display()))?;
+    std::fs::rename(&tmp, out)
+        .with_context(|| format!("failed to replace {}", out.display()))?;
 
-    println!(
-        "wrote {} ({} card{}, {:.0} KB)",
-        out.display(),
-        total,
-        if total == 1 { "" } else { "s" },
-        std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) as f64 / 1024.0
-    );
-    if sources.len() > 1 {
-        eprintln!("note: a snapshot holds one database; ignored the extra --also path(s)");
-    }
-    Ok(())
+    Ok(total)
 }
 
 pub fn open_in_browser(target: &str) {
@@ -249,9 +271,27 @@ pub fn read_cards(path: &Path) -> Result<Vec<Card>> {
     )
     .with_context(|| format!("failed to open {}", path.display()))?;
 
+    // A database reached through --also is opened read-only and may predate a
+    // column this build knows about; substitute empties rather than failing.
+    let present: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(cards)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let cols: Vec<String> = crate::SELECT_COLS
+        .split(", ")
+        .map(|c| {
+            if present.iter().any(|p| p == c) {
+                c.to_string()
+            } else {
+                format!("'' AS {c}")
+            }
+        })
+        .collect();
+
     let sql = format!(
         "SELECT {} FROM cards ORDER BY priority DESC, created_at ASC",
-        crate::SELECT_COLS
+        cols.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], crate::row_to_card)?;
@@ -260,5 +300,7 @@ pub fn read_cards(path: &Path) -> Result<Vec<Card>> {
     for r in rows {
         out.push(r?);
     }
+    // The typed notes ride along so the card detail can show a timeline.
+    crate::load_entries(&conn, &mut out);
     Ok(out)
 }
