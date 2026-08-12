@@ -1,8 +1,10 @@
-//! `bl serve` — read-only localhost dashboard over one or more backlog databases.
+//! The board view — the same embedded page, delivered two ways:
+//! `bl serve` (live, polling localhost) and `bl export` (a self-contained
+//! snapshot file with the cards baked in).
 //!
-//! Deliberately dependency-free: a small blocking HTTP/1.1 server on std::net,
-//! serving an embedded single-page dashboard plus a JSON card feed.
+//! Deliberately dependency-free: a small blocking HTTP/1.1 server on std::net.
 
+use crate::Card;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -11,35 +13,48 @@ use std::path::{Path, PathBuf};
 
 const DASHBOARD: &str = include_str!("dashboard.html");
 
-/// A database the dashboard is allowed to read. Paths are fixed at launch, so
-/// a query parameter can only pick one of them — never an arbitrary file.
+/// The placeholder the page ships with; export swaps it for real card data.
+const BOOTSTRAP_SLOT: &str = r#"<script id="bldata" type="application/json">null</script>"#;
+
+/// A database the board is allowed to read. Paths are fixed at launch, so a
+/// query parameter can only pick one of them — never an arbitrary file.
 pub struct Source {
     pub label: String,
     pub path: PathBuf,
 }
 
-pub fn run(sources: Vec<Source>, port: u16, open: bool) -> Result<()> {
-    if sources.is_empty() {
-        anyhow::bail!("no databases to serve");
-    }
-    for s in &sources {
-        if !s.path.exists() {
-            anyhow::bail!("database not found: {}", s.path.display());
-        }
-    }
+#[derive(serde::Serialize)]
+struct DbRef {
+    index: usize,
+    label: String,
+    path: String,
+}
+
+#[derive(serde::Serialize)]
+struct Feed {
+    db: DbRef,
+    databases: Vec<DbRef>,
+    generated_at: String,
+    cards: Vec<Card>,
+}
+
+// ---------------------------------------------------------------- serve
+
+pub fn serve(sources: Vec<Source>, port: u16, open: bool) -> Result<()> {
+    check_sources(&sources)?;
 
     let listener = TcpListener::bind(("127.0.0.1", port))
         .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
     let url = format!("http://127.0.0.1:{port}");
 
-    println!("bl dashboard on {url}");
+    println!("bl board on {url}");
     for (i, s) in sources.iter().enumerate() {
         println!("  [{i}] {}  {}", s.label, s.path.display());
     }
     println!("ctrl-c to stop");
 
     if open {
-        let _ = std::process::Command::new("open").arg(&url).status();
+        open_in_browser(&url);
     }
 
     // One thread per connection: browsers pre-open sockets they may never use,
@@ -82,7 +97,7 @@ fn handle(mut stream: TcpStream, sources: &[Source]) -> Result<()> {
             match feed_json(sources, idx) {
                 Ok(body) => respond(&mut stream, 200, "application/json", &body),
                 Err(e) => {
-                    let body = format!("{{\"error\":{}}}", json_string(&e.to_string()));
+                    let body = serde_json::json!({ "error": e.to_string() }).to_string();
                     respond(&mut stream, 500, "application/json", &body)
                 }
             }
@@ -140,69 +155,110 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) 
     Ok(())
 }
 
-fn feed_json(sources: &[Source], idx: usize) -> Result<String> {
-    let src = &sources[idx];
-    let cards = read_cards(&src.path)?;
+// ---------------------------------------------------------------- export
 
-    let dbs: Vec<String> = sources
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            format!(
-                "{{\"index\":{i},\"label\":{},\"path\":{}}}",
-                json_string(&s.label),
-                json_string(&s.path.display().to_string())
-            )
-        })
-        .collect();
+/// Writes a standalone snapshot: one HTML file with the cards baked in, no
+/// server and no network needed to open it.
+pub fn export(sources: Vec<Source>, out: &Path) -> Result<()> {
+    check_sources(&sources)?;
 
-    Ok(format!(
-        "{{\"db\":{{\"index\":{idx},\"label\":{},\"path\":{}}},\"databases\":[{}],\"cards\":[{}]}}",
-        json_string(&src.label),
-        json_string(&src.path.display().to_string()),
-        dbs.join(","),
-        cards.join(",")
-    ))
+    // A snapshot holds one database — there is nothing to switch between.
+    let feed = feed(&sources[..1], 0)?;
+    let total = feed.cards.len();
+
+    // `<` can't appear raw inside the data block or a card's text could close
+    // the script tag; escaping it keeps the JSON valid either way.
+    let safe = serde_json::to_string(&feed)?.replace('<', "\\u003c");
+    let block = format!(r#"<script id="bldata" type="application/json">{safe}</script>"#);
+    let page = DASHBOARD.replace(BOOTSTRAP_SLOT, &block);
+    if page == DASHBOARD {
+        anyhow::bail!("dashboard template is missing its data slot");
+    }
+
+    if let Some(dir) = out.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+    }
+    std::fs::write(out, page).with_context(|| format!("failed to write {}", out.display()))?;
+
+    println!(
+        "wrote {} ({} card{}, {:.0} KB)",
+        out.display(),
+        total,
+        if total == 1 { "" } else { "s" },
+        std::fs::metadata(out).map(|m| m.len()).unwrap_or(0) as f64 / 1024.0
+    );
+    if sources.len() > 1 {
+        eprintln!("note: a snapshot holds one database; ignored the extra --also path(s)");
+    }
+    Ok(())
 }
 
-fn read_cards(path: &Path) -> Result<Vec<String>> {
+pub fn open_in_browser(target: &str) {
+    let _ = std::process::Command::new("open").arg(target).status();
+}
+
+// ---------------------------------------------------------------- data
+
+fn check_sources(sources: &[Source]) -> Result<()> {
+    if sources.is_empty() {
+        anyhow::bail!("no databases to read");
+    }
+    for s in sources {
+        if !s.path.exists() {
+            anyhow::bail!("database not found: {}", s.path.display());
+        }
+    }
+    Ok(())
+}
+
+fn feed_json(sources: &[Source], idx: usize) -> Result<String> {
+    Ok(serde_json::to_string(&feed(sources, idx)?)?)
+}
+
+fn feed(sources: &[Source], idx: usize) -> Result<Feed> {
+    let src = &sources[idx];
+    // Absolute, so a snapshot mailed elsewhere still says which backlog it came from.
+    let dbref = |i: usize, s: &Source| DbRef {
+        index: i,
+        label: s.label.clone(),
+        path: s
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| s.path.clone())
+            .display()
+            .to_string(),
+    };
+    let feed = Feed {
+        db: dbref(idx, src),
+        databases: sources.iter().enumerate().map(|(i, s)| dbref(i, s)).collect(),
+        generated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        cards: read_cards(&src.path)?,
+    };
+    Ok(feed)
+}
+
+/// Reads every card, highest priority first. Opened read-only: the board and
+/// the snapshot never write to a backlog.
+pub fn read_cards(path: &Path) -> Result<Vec<Card>> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .with_context(|| format!("failed to open {}", path.display()))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, title, notes, label, status, priority, outcome,
-                COALESCE(claimed_by, ''), COALESCE(claimed_at, ''), created_at, updated_at
-         FROM cards
-         ORDER BY priority DESC, created_at ASC",
-    )?;
-
-    let rows = stmt.query_map([], |row| {
-        Ok(format!(
-            "{{\"id\":{},\"title\":{},\"notes\":{},\"label\":{},\"status\":{},\"priority\":{},\"outcome\":{},\"claimed_by\":{},\"claimed_at\":{},\"created_at\":{},\"updated_at\":{}}}",
-            row.get::<_, i64>(0)?,
-            json_string(&row.get::<_, String>(1)?),
-            json_string(&row.get::<_, String>(2)?),
-            json_string(&row.get::<_, String>(3)?),
-            json_string(&row.get::<_, String>(4)?),
-            row.get::<_, i64>(5)?,
-            json_string(&row.get::<_, String>(6)?),
-            json_string(&row.get::<_, String>(7)?),
-            json_string(&row.get::<_, String>(8)?),
-            json_string(&row.get::<_, String>(9)?),
-            json_string(&row.get::<_, String>(10)?),
-        ))
-    })?;
+    let sql = format!(
+        "SELECT {} FROM cards ORDER BY priority DESC, created_at ASC",
+        crate::SELECT_COLS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], crate::row_to_card)?;
 
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
     }
     Ok(out)
-}
-
-fn json_string(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
 }

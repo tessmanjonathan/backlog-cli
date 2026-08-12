@@ -42,11 +42,36 @@ bl decay --amount 25   # run daily / on schedule
 | `bl show <id> [--json]` | One card |
 | `bl note <id> "text"` | Append to notes |
 | `bl decay [-a 25]` | Subtract priority from all non-done cards |
-| `bl serve [-p 7788] [--also other.db] [--open]` | Read-only board view on localhost |
+| `bl board [-l label] [-d 8] [--watch]` | Draw the board in the terminal |
+| `bl export [-o view/index.html] [--open]` | Standalone HTML snapshot, no server |
+| `bl serve [-p 7788] [--also other.db] [--open]` | Live board view on localhost |
 
 Env / flag: `BL_DB` or `--db path` overrides the database location (default `./backlog.db`).
 
 ## Board view
+
+The same board — summary tiles, open cards by label, priority distribution, and the
+`new / ready / in_progress / done` columns — in three deliveries.
+
+**Terminal.** No browser, no server:
+
+```bash
+bl board                    # draw it once
+bl board --watch            # redraw every 5s (--watch 2 for faster)
+bl board -l worldgen -d 20  # one label, more done cards
+```
+
+Sizes itself to the terminal; honors `NO_COLOR` and pipes cleanly to a file.
+
+**Static snapshot.** One self-contained HTML file with the cards baked in — open it with
+`file://`, commit it, or mail it. Nothing is fetched at view time:
+
+```bash
+bl export                        # writes view/index.html
+bl export -o docs/backlog.html --open
+```
+
+**Live server.** Polls every 5s, so an agent loop's progress shows up as it happens:
 
 ```bash
 bl serve --open                                   # board for ./backlog.db on :7788
@@ -54,14 +79,12 @@ bl --db ~/git/foo/backlog.db serve \
    --also ~/git/bar/backlog.db --port 9000        # switch between projects in the UI
 ```
 
-Serves a dashboard at `http://127.0.0.1:7788` — summary tiles, open cards by label,
-priority distribution, and a `new / ready / in_progress / done` board. Click a card for
-notes, outcome, claim and timestamps; `#card-12` in the URL deep-links to one card.
-Polls every 5s, so an agent loop's progress shows up live.
+In both HTML views, click a card for notes, outcome, claim and timestamps; `#card-12` in
+the URL deep-links to one card.
 
-Read-only by design: the databases are opened `SQLITE_OPEN_READ_ONLY`, only the paths
-given on the command line are reachable, and the listener binds `127.0.0.1` only. Use the
-CLI to make changes.
+Read-only by design: databases are opened `SQLITE_OPEN_READ_ONLY`, only the paths given on
+the command line are reachable, and the server binds `127.0.0.1` only. Use the CLI to make
+changes.
 
 ## Suggested agent flow
 

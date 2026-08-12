@@ -178,6 +178,8 @@
     display: block;
   }
   .pulse.beat i { animation: beat 1s ease-out; }
+  /* A snapshot isn't live — say so rather than implying a heartbeat. */
+  .pulse.frozen i { background: var(--ink-3); }
   @keyframes beat {
     0% { transform: scale(2.6); opacity: 0.35; }
     100% { transform: scale(1); opacity: 1; }
@@ -499,9 +501,15 @@
 <div class="scrim" id="scrim" hidden></div>
 <aside class="rail" id="rail" hidden aria-label="Card detail"></aside>
 
+<script id="bldata" type="application/json">null</script>
 <script>
 (() => {
   "use strict";
+
+  // `bl export` bakes the cards into the block above; when it holds data this
+  // page is a snapshot and never talks to a server.
+  const BOOT = JSON.parse(document.getElementById("bldata").textContent);
+  const SNAPSHOT = BOOT !== null;
 
   const COLUMNS = [
     { key: "new",         name: "New",         color: "var(--s-new)" },
@@ -737,30 +745,33 @@
     state.label = pick.value;
   }
 
+  function apply(data) {
+    state.cards = data.cards;
+    state.dbPath = data.db.path;
+    $("dbpath").innerHTML = `<bdi>${esc(data.db.path)}</bdi>`;
+    $("dbpath").title = data.db.path;
+
+    const pick = $("dbpick");
+    const sig = data.databases.map((d) => d.label).join("|");
+    if (pick.dataset.sig !== sig) {
+      pick.dataset.sig = sig;
+      pick.innerHTML = data.databases
+        .map((d) => `<option value="${d.index}">${esc(d.label)}</option>`).join("");
+    }
+    pick.value = String(data.db.index);
+    pick.hidden = data.databases.length < 2;
+
+    syncLabelPicker();
+    $("banner").hidden = true;
+    renderAll();
+  }
+
   async function load() {
     try {
       const res = await fetch(`/api/cards?db=${state.db}`, { cache: "no-store" });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
-
-      state.cards = data.cards;
-      state.dbPath = data.db.path;
-      $("dbpath").innerHTML = `<bdi>${esc(data.db.path)}</bdi>`;
-      $("dbpath").title = data.db.path;
-
-      const pick = $("dbpick");
-      const sig = data.databases.map((d) => d.label).join("|");
-      if (pick.dataset.sig !== sig) {
-        pick.dataset.sig = sig;
-        pick.innerHTML = data.databases
-          .map((d) => `<option value="${d.index}">${esc(d.label)}</option>`).join("");
-      }
-      pick.value = String(data.db.index);
-      pick.hidden = data.databases.length < 2;
-
-      syncLabelPicker();
-      $("banner").hidden = true;
-      renderAll();
+      apply(data);
 
       const p = $("pulse");
       p.classList.remove("beat");
@@ -812,8 +823,14 @@
   const linked = /^#card-(\d+)$/.exec(location.hash);
   if (linked) state.selected = Number(linked[1]);
 
-  load();
-  setInterval(load, 5000);
+  if (SNAPSHOT) {
+    document.getElementById("pulse").classList.add("frozen");
+    $("pulsetext").textContent = "snapshot · " + BOOT.generated_at + " UTC";
+    apply(BOOT);
+  } else {
+    load();
+    setInterval(load, 5000);
+  }
 })();
 </script>
 </body>

@@ -1,4 +1,5 @@
-mod serve;
+mod board;
+mod view;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -173,6 +174,34 @@ enum Commands {
         open: bool,
     },
 
+    /// Write a standalone HTML snapshot of the board (no server needed)
+    Export {
+        /// Output file (default: view/index.html)
+        #[arg(short, long, default_value = "view/index.html")]
+        out: PathBuf,
+        /// Open the snapshot in the default browser
+        #[arg(long)]
+        open: bool,
+    },
+
+    /// Draw the board in the terminal
+    Board {
+        #[arg(short, long)]
+        label: Option<String>,
+        /// How many done cards to show
+        #[arg(short, long, default_value_t = 8)]
+        done: usize,
+        /// Force a column width instead of detecting the terminal's
+        #[arg(long)]
+        width: Option<usize>,
+        /// Redraw every N seconds until interrupted
+        #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "5")]
+        watch: Option<u64>,
+        /// Disable color
+        #[arg(long)]
+        no_color: bool,
+    },
+
     /// Decrement priority of all non-done cards (decay)
     Decay {
         #[arg(short, long, default_value_t = 25)]
@@ -266,21 +295,21 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
 }
 
 #[derive(Debug, serde::Serialize)]
-struct Card {
-    id: i64,
-    title: String,
-    notes: String,
-    label: String,
-    status: String,
-    priority: i32,
-    outcome: String,
-    claimed_by: String,
-    claimed_at: String,
-    created_at: String,
-    updated_at: String,
+pub(crate) struct Card {
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) notes: String,
+    pub(crate) label: String,
+    pub(crate) status: String,
+    pub(crate) priority: i32,
+    pub(crate) outcome: String,
+    pub(crate) claimed_by: String,
+    pub(crate) claimed_at: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
 }
 
-fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
+pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
     Ok(Card {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -296,7 +325,7 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
     })
 }
 
-const SELECT_COLS: &str =
+pub(crate) const SELECT_COLS: &str =
     "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, created_at, updated_at";
 
 fn print_card(c: &Card, json: bool) {
@@ -332,6 +361,26 @@ fn print_card(c: &Card, json: bool) {
         }
         println!("    created: {}   updated: {}", c.created_at, c.updated_at);
     }
+}
+
+/// Databases the board may read: the primary one plus any `--also` paths.
+/// Creates/migrates the primary so a fresh project still opens to a board.
+fn view_sources(path: &Path, also: Vec<PathBuf>) -> Result<Vec<view::Source>> {
+    let conn = open_db(path)?;
+    ensure_schema(&conn)?;
+    drop(conn);
+
+    let mut sources = vec![view::Source {
+        label: source_label(path),
+        path: path.to_path_buf(),
+    }];
+    for p in also {
+        sources.push(view::Source {
+            label: source_label(&p),
+            path: p,
+        });
+    }
+    Ok(sources)
 }
 
 /// Short human label for a database: `<parent dir>/<file>` when we can get it.
@@ -752,22 +801,39 @@ fn main() -> Result<()> {
         }
 
         Commands::Serve { port, also, open } => {
-            // Ensure the primary DB exists and is current before anyone looks at it.
+            let sources = view_sources(&path, also)?;
+            view::serve(sources, port, open)?;
+        }
+
+        Commands::Export { out, open } => {
+            let sources = view_sources(&path, Vec::new())?;
+            view::export(sources, &out)?;
+            if open {
+                let abs = out.canonicalize().unwrap_or(out);
+                view::open_in_browser(&abs.display().to_string());
+            }
+        }
+
+        Commands::Board {
+            label,
+            done,
+            width,
+            watch,
+            no_color,
+        } => {
             let conn = open_db(&path)?;
             ensure_schema(&conn)?;
             drop(conn);
-
-            let mut sources = vec![serve::Source {
-                label: source_label(&path),
-                path: path.clone(),
-            }];
-            for p in also {
-                sources.push(serve::Source {
-                    label: source_label(&p),
-                    path: p,
-                });
-            }
-            serve::run(sources, port, open)?;
+            board::run(
+                &path,
+                &board::Opts {
+                    label,
+                    done,
+                    width,
+                    watch,
+                    color: !no_color,
+                },
+            )?;
         }
 
         Commands::Decay { amount } => {
