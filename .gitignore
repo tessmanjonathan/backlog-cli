@@ -3,3 +3,4 @@ backlog.db
 backlog.db-wal
 backlog.db-shm
 view/index.html.tmp
+view/index.html
