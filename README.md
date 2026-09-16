@@ -80,6 +80,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl init` | Create the central store and register this repository (`--db` for one file) |
 | `bl project add\|list\|current\|activate\|deactivate\|remove` | Which repositories share the store |
 | `bl import <backlog.db> [--project N] [--dry-run] [--json]` | Copy a repo-level board into the store |
+| `bl import --stdin [--if-absent] [--by who] [--dry-run]` | File many cards at once from a JSON array or JSON lines (`{"title", "label"?, "priority"?, "notes"?, "project"?}`); prints the ids as JSON |
 | `bl migrate [--scan DIR]... [--dry-run]` | Import every repo-level board it can find |
 | `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent]` | New card (status=new) |
 | `bl edit <id> [--title] [--label] [--priority] [--notes] [--outcome] [--status] [--move PROJECT] [--by who] [--json]` | Change any field, all flags in one transaction |

@@ -73,6 +73,7 @@ long one — the next agent can filter them.
 | `bl show <id> [--json]` | One card in full |
 | `bl list [--label X] [--status new,ready,in_progress] [-n 30] [--json]` | Ordered by priority |
 | `bl create "title" [--label X] [--priority 0-10000] [--notes "..."] [--if-absent]` | New card (status `new`) |
+| `bl import --stdin [--if-absent] [--by <id>]` | File many cards in one call: pipe a JSON array or one `{"title", "label"?, "priority"?, "notes"?}` per line; ids come back as JSON |
 | `bl search <words...> [--label X] [--open] [--json]` | Find cards by any word in them |
 | `bl note <id> "text" [--kind K] [--by <id>] [--commit [REV]] [--unique]` | Add a note |
 | `bl notes <id> [--kind K] [--json]` | Read a card's notes (each line ends with its note id) |

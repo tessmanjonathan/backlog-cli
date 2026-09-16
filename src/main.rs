@@ -163,10 +163,21 @@ enum Commands {
         action: ProjectAction,
     },
 
-    /// Copy a repo-level backlog.db into the central store (source untouched)
+    /// Copy a repo-level backlog.db into the store, or file many cards from stdin
     Import {
-        /// The backlog.db to read
-        source: PathBuf,
+        /// The backlog.db to read (or use --stdin)
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        source: Option<PathBuf>,
+        /// Read cards from stdin: a JSON array or one JSON object per line
+        /// ({"title", "label"?, "priority"?, "notes"?, "project"?}); prints the new ids as JSON
+        #[arg(long)]
+        stdin: bool,
+        /// With --stdin: a card whose exact title already exists is reported, not filed again
+        #[arg(long, requires = "stdin")]
+        if_absent: bool,
+        /// With --stdin: who is filing them, for notes and the event log
+        #[arg(long, requires = "stdin")]
+        by: Option<String>,
         /// Count what would happen without writing
         #[arg(long)]
         dry_run: bool,
@@ -481,7 +492,7 @@ impl Commands {
     fn wants_store(&self) -> bool {
         matches!(
             self,
-            Commands::Project { .. } | Commands::Import { .. } | Commands::Migrate { .. }
+            Commands::Project { .. } | Commands::Import { stdin: false, .. } | Commands::Migrate { .. }
         )
     }
 }
@@ -1542,6 +1553,16 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
     Ok((changed, moved.is_some()))
 }
 
+// ---------------------------------------------------------------- guards
+
+/// A title must not be empty. (Length limits arrive with the guard card.)
+pub(crate) fn check_title(title: &str, _force: bool) -> Result<()> {
+    if title.trim().is_empty() {
+        bail!("a title cannot be empty");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- delete
 
 /// Remove one card and its notes inside the caller's transaction, leaving a
@@ -1804,7 +1825,21 @@ fn main() -> Result<()> {
 
         Commands::Project { action } => project_cmd(&ctx, action)?,
 
-        Commands::Import { source, dry_run, json } => {
+        Commands::Import { source: None, by, if_absent, dry_run, .. } => {
+            let out = import::from_stdin(&ctx, by.as_deref().unwrap_or(""), if_absent, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            if dry_run {
+                eprintln!("bl: dry run, {} card(s) would be created", out.len());
+            } else {
+                let made = out.iter().filter(|c| c.created).count();
+                eprintln!("bl: {} card(s) created, {} already present", made, out.len() - made);
+                if made > 0 {
+                    refresh_views(&ctx, None);
+                }
+            }
+        }
+
+        Commands::Import { source: Some(source), dry_run, json, .. } => {
             // The global --project names (or creates) the target project.
             let out = import::run(&ctx, &source, cli.project.as_deref(), dry_run)?;
             if json {

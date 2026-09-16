@@ -234,5 +234,25 @@ if $BL note rm 999999 2>/dev/null; then fail "rm of a missing note should fail";
 if $BL note "$nc" 2>/dev/null; then fail "bl note with no text should fail"; fi
 ok "note edit / rm"
 
+# 20. import --stdin: array or JSON lines, notes typed, --if-absent, atomic on a bad line
+cd "$T/alpha"
+out=$(printf '[{"title":"planned one","label":"plan","priority":6100,"notes":"from the planner"},{"title":"planned two","notes":[{"kind":"finding","body":"typed note"},"plain note"]}]' | $BL import --stdin --by planner 2>/dev/null)
+[ "$(echo "$out" | grep -c '"created": true')" = 2 ] || fail "stdin array created count: $out"
+p1=$(echo "$out" | grep -o '"id": [0-9]*' | head -1 | grep -o '[0-9]*')
+$BL show "$p1" | grep -q "\[ 6100\]  new           alpha: \[plan\] planned one" || fail "stdin card fields: $($BL show "$p1" | head -1)"
+$BL notes "$p1" | grep -q "planner" || fail "stdin note author"
+p2=$(echo "$out" | grep -o '"id": [0-9]*' | tail -1 | grep -o '[0-9]*')
+$BL notes "$p2" | grep -q "^\[finding\]" || fail "typed stdin note"
+$BL history "$p1" | grep -q "created .*→ planned one  by planner" || fail "stdin created event"
+out=$(printf '{"title":"planned one"}\n{"title":"planned three","project":"beta"}\n' | $BL import --stdin --if-absent 2>/dev/null)
+echo "$out" | grep -q '"created": false' || fail "--if-absent did not report the existing card"
+echo "$out" | grep -q '"project": "beta"' || fail "per-card project"
+before=$($BL list --all --json | grep -c '"title"')
+if printf '{"title":"ok"}\n{"title":""}\n' | $BL import --stdin >/dev/null 2>&1; then fail "empty title accepted"; fi
+[ "$($BL list --all --json | grep -c '"title"')" = "$before" ] || fail "bad batch left cards behind"
+printf '[{"title":"dry"}]' | $BL import --stdin --dry-run 2>/dev/null | grep -q '"created": false' || fail "dry run"
+$BL search dry --open >/dev/null 2>&1 && fail "dry run wrote"
+ok "import --stdin"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

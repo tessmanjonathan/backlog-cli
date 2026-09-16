@@ -315,3 +315,173 @@ pub(crate) fn summary(o: &Outcome) -> String {
     }
     s
 }
+
+// ---------------------------------------------------------------- stdin
+
+/// One card as a planning agent files it: `{"title": "...", "label": "art",
+/// "priority": 7000, "notes": "..." | ["...", {"kind": "finding", "body": "..."}]}`.
+#[derive(Debug, serde::Deserialize)]
+struct Incoming {
+    title: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    priority: Option<i32>,
+    #[serde(default)]
+    notes: Notes,
+    /// Another registered project than the scoped one, by name or #id.
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(untagged)]
+enum Notes {
+    #[default]
+    None,
+    One(String),
+    Many(Vec<NoteIn>),
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum NoteIn {
+    Plain(String),
+    Typed {
+        body: String,
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        by: Option<String>,
+    },
+}
+
+/// What happened to each incoming card, in input order.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct Created {
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) project: String,
+    /// False when `--if-absent` found the title already on the board.
+    pub(crate) created: bool,
+}
+
+/// A JSON array, or one JSON object per line.
+fn parse_incoming(text: &str) -> Result<Vec<Incoming>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("nothing on stdin: pipe a JSON array or one JSON object per line");
+    }
+    if trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed).context("stdin is not a JSON array of cards");
+    }
+    let mut out = Vec::new();
+    for (i, line) in trimmed.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let card: Incoming = serde_json::from_str(line)
+            .with_context(|| format!("line {} is not a JSON card object", i + 1))?;
+        out.push(card);
+    }
+    Ok(out)
+}
+
+/// `bl import --stdin`: file many cards in one transaction. Works in any
+/// scope `bl create` works in, including `--db` files.
+pub(crate) fn from_stdin(ctx: &Ctx, by: &str, if_absent: bool, dry_run: bool) -> Result<Vec<Created>> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text).context("failed to read stdin")?;
+    let incoming = parse_incoming(&text)?;
+    let conn = &ctx.conn;
+    let now = crate::now_str();
+
+    // Validate everything before writing anything, so a bad line 17 does not
+    // leave 16 cards behind.
+    let mut planned: Vec<(Incoming, Project)> = Vec::new();
+    for (i, c) in incoming.into_iter().enumerate() {
+        if c.title.trim().is_empty() {
+            bail!("card {} has an empty title", i + 1);
+        }
+        crate::check_title(&c.title, false)?;
+        if let Some(p) = c.priority {
+            if !(0..=10000).contains(&p) {
+                bail!("card {} ('{}'): priority must be 0..=10000", i + 1, c.title);
+            }
+        }
+        let project = match &c.project {
+            Some(key) => store::lookup(conn, key)?
+                .ok_or_else(|| anyhow::anyhow!("card {} ('{}'): no project named '{}'", i + 1, c.title, key))?,
+            None => ctx.require_project()?.clone(),
+        };
+        planned.push((c, project));
+    }
+
+    let mut out = Vec::new();
+    if dry_run {
+        for (c, p) in &planned {
+            out.push(Created { id: 0, title: c.title.trim().to_string(), project: p.name.clone(), created: false });
+        }
+        return Ok(out);
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        for (c, project) in &planned {
+            let title = c.title.trim().to_string();
+            if if_absent {
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM cards WHERE title = ?1 AND project_id = ?2 ORDER BY id ASC LIMIT 1",
+                        params![title, project.id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = existing {
+                    out.push(Created { id, title, project: project.name.clone(), created: false });
+                    continue;
+                }
+            }
+            conn.execute(
+                "INSERT INTO cards (title, notes, label, priority, created_at, updated_at, project_id)
+                 VALUES (?1, '', ?2, ?3, ?4, ?4, ?5)",
+                params![title, c.label.trim(), c.priority.unwrap_or(5000), now, project.id],
+            )?;
+            let id = conn.last_insert_rowid();
+            let notes: Vec<(String, String, String)> = match &c.notes {
+                Notes::None => Vec::new(),
+                Notes::One(s) => s
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .map(|l| ("note".to_string(), l.trim().to_string(), by.to_string()))
+                    .collect(),
+                Notes::Many(v) => v
+                    .iter()
+                    .map(|n| match n {
+                        NoteIn::Plain(s) => ("note".to_string(), s.clone(), by.to_string()),
+                        NoteIn::Typed { body, kind, by: who } => (
+                            kind.clone().unwrap_or_else(|| "note".to_string()),
+                            body.clone(),
+                            who.clone().unwrap_or_else(|| by.to_string()),
+                        ),
+                    })
+                    .collect(),
+            };
+            for (kind, body, who) in &notes {
+                notes::add(conn, id, kind, who, body, None, false, &now)?;
+            }
+            crate::events::record(conn, id, Some(project.id), "created", "", &title, by, &now)?;
+            out.push(Created { id, title, project: project.name.clone(), created: true });
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
+    }
+    Ok(out)
+}
