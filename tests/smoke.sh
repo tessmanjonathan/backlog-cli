@@ -109,5 +109,24 @@ grep -q "refresh me" "$T/alpha/view/index.html" || fail "auto export not refresh
 export BL_NO_AUTOEXPORT=1
 ok "per-project auto export"
 
+# 12. import a repo-level db into the store: new ids, legacy ids kept, idempotent
+cd "$T/legacy"
+git init -q .
+out=$($BL import "$T/legacy/backlog.db")
+echo "$out" | grep -q "2 card(s) imported" || fail "import count: $out"
+new=$(echo "$out" | grep -o '#1 → #[0-9]*' | grep -o '[0-9]*$')
+$BL show "$new" | grep -q "imported: was #1" || fail "legacy id not shown"
+$BL notes "$new" | grep -q "one line of notes" || fail "legacy notes not imported"
+$BL project current | grep -q " legacy " || fail "legacy dir not registered by import"
+$BL import "$T/legacy/backlog.db" | grep -q "0 card(s) imported, 0 note(s), 2 already present" || fail "import not idempotent"
+ok "import with legacy ids, idempotent"
+
+# 13. migrate scans a directory of repos; gamma's local db comes in
+$BL migrate --scan "$T" --dry-run | grep -q "would import.*gamma" || fail "migrate dry-run"
+$BL migrate --scan "$T" | grep -q "gamma.*1 card(s) imported" || fail "migrate gamma"
+cd "$T/gamma"; rm backlog.db
+$BL list | grep -q "gamma local" || fail "gamma not served from the store after migrate"
+ok "migrate --scan"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

@@ -1,4 +1,5 @@
 mod board;
+mod import;
 mod notes;
 mod store;
 mod view;
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS cards (
     commits     TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    project_id  INTEGER NOT NULL DEFAULT 0
+    project_id  INTEGER NOT NULL DEFAULT 0,
+    legacy_id   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_status_priority
@@ -141,6 +143,28 @@ enum Commands {
     Project {
         #[command(subcommand)]
         action: ProjectAction,
+    },
+
+    /// Copy a repo-level backlog.db into the central store (source untouched)
+    Import {
+        /// The backlog.db to read
+        source: PathBuf,
+        /// Count what would happen without writing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Import every repo-level backlog.db beside a registered project or under --scan dirs
+    Migrate {
+        /// Directories whose immediate children may hold a backlog.db (e.g. ~/git)
+        #[arg(long, value_name = "DIR")]
+        scan: Vec<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Create a new card
@@ -355,6 +379,17 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// Commands about the store itself, which must never be redirected to a
+    /// repo-level file by the unregistered-repository fallback.
+    fn wants_store(&self) -> bool {
+        matches!(
+            self,
+            Commands::Project { .. } | Commands::Import { .. } | Commands::Migrate { .. }
+        )
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum ProjectAction {
     /// Register a repository (default: the one the current directory is in)
@@ -478,7 +513,7 @@ fn open_ctx(cli: &Cli) -> Result<Ctx> {
     // A repository that still carries its own backlog.db and is not registered
     // in the store keeps working against that file, so nothing breaks between
     // creating the store and importing each project into it.
-    if central && project.is_none() && cli.project.is_none() {
+    if central && project.is_none() && cli.project.is_none() && !cli.command.wants_store() {
         let local = PathBuf::from(DEFAULT_DB);
         if local.exists() {
             eprintln!(
@@ -552,6 +587,12 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
     }
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_project ON cards(project_id, status);")?;
 
+    // The id a card had in the repo-level database it was imported from.
+    if !column_exists(conn, "cards", "legacy_id")? {
+        conn.execute_batch("ALTER TABLE cards ADD COLUMN legacy_id INTEGER;")?;
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_legacy ON cards(project_id, legacy_id);")?;
+
     // Migrate older DBs that lack claim columns / in_progress status
     if !column_exists(conn, "cards", "claimed_by")? {
         conn.execute_batch(
@@ -595,13 +636,14 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
                 commits     TEXT NOT NULL DEFAULT '',
                 created_at  TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                project_id  INTEGER NOT NULL DEFAULT 0
+                project_id  INTEGER NOT NULL DEFAULT 0,
+                legacy_id   INTEGER
             );
-            INSERT INTO cards_new (id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id)
+            INSERT INTO cards_new (id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, legacy_id)
             SELECT id, title, notes, label, status, priority, outcome,
                    COALESCE(claimed_by, ''), COALESCE(claimed_at, ''),
                    COALESCE(commits, ''),
-                   created_at, updated_at, COALESCE(project_id, 0)
+                   created_at, updated_at, COALESCE(project_id, 0), legacy_id
             FROM cards;
             DROP TABLE cards;
             ALTER TABLE cards_new RENAME TO cards;
@@ -678,6 +720,9 @@ pub(crate) struct Card {
     /// The project's name, resolved at read time so a card always says
     /// which repository it is about.
     pub(crate) project: String,
+    /// The id this card had in the repo-level database it was imported from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_id: Option<i64>,
     /// The notes as rows. Empty unless the caller asked for them, and always
     /// empty for a database old enough to lack the table.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -700,6 +745,7 @@ pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         updated_at: row.get(11)?,
         project_id: row.get::<_, i64>(12).unwrap_or(0),
         project: row.get::<_, String>(13).unwrap_or_default(),
+        legacy_id: row.get::<_, Option<i64>>(14).unwrap_or(None),
         entries: Vec::new(),
     })
 }
@@ -719,13 +765,16 @@ pub(crate) fn load_entries(conn: &Connection, cards: &mut [Card]) {
 pub(crate) const CARD_COLS: &str =
     "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id";
 
+/// Columns that come after the project name in `row_to_card` order.
+pub(crate) const TRAILING_COLS: &str = "legacy_id";
+
 /// The project's name, looked up per row. No comma-space inside, so
 /// `read_cards` can still split the list on `", "`.
 pub(crate) const PROJECT_COL: &str =
     "IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project";
 
 pub(crate) const SELECT_COLS: &str =
-    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project";
+    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project, legacy_id";
 
 /// Print a card. `show_project` puts the project name on the first line, for
 /// listings that span more than one.
@@ -764,6 +813,9 @@ fn print_card(c: &Card, json: bool, show_project: bool) {
         }
         if !c.claimed_at.is_empty() {
             println!("    claimed_at: {}", c.claimed_at);
+        }
+        if let Some(old) = c.legacy_id {
+            println!("    imported: was #{} in {}'s own backlog.db", old, c.project);
         }
         for line in c.commits.lines().filter(|l| !l.trim().is_empty()) {
             let (sha, subject) = line.split_once('\t').unwrap_or((line, ""));
@@ -1286,6 +1338,57 @@ fn main() -> Result<()> {
         Commands::Init => unreachable!("handled above"),
 
         Commands::Project { action } => project_cmd(&ctx, action)?,
+
+        Commands::Import { source, dry_run, json } => {
+            // The global --project names (or creates) the target project.
+            let out = import::run(&ctx, &source, cli.project.as_deref(), dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("{}", import::summary(&out));
+                if !dry_run {
+                    for (old, new) in &out.imported {
+                        println!("  #{} → #{}", old, new);
+                    }
+                    if !out.imported.is_empty() {
+                        println!(
+                            "notes still say #<old>; `bl show <new>` prints the old id, and the map above is the key.\n\
+                             Delete or gitignore {} so nothing writes to it again.",
+                            out.source
+                        );
+                    }
+                }
+            }
+            if !dry_run && !out.imported.is_empty() {
+                refresh_views(&ctx, None);
+            }
+        }
+
+        Commands::Migrate { scan, dry_run, json } => {
+            let found = import::candidates(&ctx, &scan)?;
+            if found.is_empty() {
+                println!("nothing to import (no backlog.db beside a registered project or under --scan)");
+                exit_with(EXIT_EMPTY);
+            }
+            let mut outs = Vec::new();
+            for db in found {
+                match import::run(&ctx, &db, None, dry_run) {
+                    Ok(o) => {
+                        if !json {
+                            println!("{}", import::summary(&o));
+                        }
+                        outs.push(o);
+                    }
+                    Err(e) => eprintln!("bl: {}: {}", db.display(), e),
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outs)?);
+            }
+            if !dry_run && outs.iter().any(|o| !o.imported.is_empty()) {
+                refresh_views(&ctx, None);
+            }
+        }
 
         Commands::Create {
             title,

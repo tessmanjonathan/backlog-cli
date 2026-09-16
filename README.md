@@ -39,6 +39,20 @@ From a directory outside any project, `bl next`, `bl list`, `bl board` and `bl e
 across every active project and name the project on each card. Inside one, `--all` does the
 same. `--project <name>` (or `BL_PROJECT`) picks a project by hand from anywhere.
 
+**Moving an existing repo-level board in:**
+
+```bash
+bl import ~/git/myproject/backlog.db     # source is read-only and untouched
+bl migrate --scan ~/git                  # every <dir>/backlog.db under ~/git, plus each registered project's
+bl migrate --dry-run
+```
+
+Imported cards get new ids in the store and keep the old one in `legacy_id`: `bl show`
+prints it, and `bl import` prints the old-to-new map. A note that says `#123` still means
+the old number, so keep the map (or the old file) if that matters. A second import of the
+same file adds nothing. Once imported, delete or gitignore the repo copy so nothing writes
+to it again.
+
 `bl` never creates a database by accident: only `bl init` does. A directory with no store and
 no `./backlog.db` gets an error, not an empty board. `--db <path>` (or `BL_DB`) still works
 against one file, and `bl init --db path` creates one; such a file gets a single project row
@@ -65,6 +79,8 @@ bl decay --amount 25   # run daily / on schedule
 |---------|---------|
 | `bl init` | Create the central store and register this repository (`--db` for one file) |
 | `bl project add\|list\|current\|activate\|deactivate\|remove` | Which repositories share the store |
+| `bl import <backlog.db> [--project N] [--dry-run] [--json]` | Copy a repo-level board into the store |
+| `bl migrate [--scan DIR]... [--dry-run]` | Import every repo-level board it can find |
 | `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent]` | New card (status=new) |
 | `bl set-priority <id> <0-10000>` | Set priority score |
 | `bl status <id> <new\|ready\|done> [--outcome "..."]` | Move status |

@@ -311,6 +311,13 @@ pub fn read_cards(path: &Path, project: Option<i64>, active_only: bool) -> Resul
     } else {
         "'' AS project".to_string()
     });
+    for c in crate::TRAILING_COLS.split(", ") {
+        cols.push(if present.iter().any(|p| p == c) {
+            c.to_string()
+        } else {
+            format!("NULL AS {c}")
+        });
+    }
 
     let mut sql = format!("SELECT {} FROM cards WHERE 1=1", cols.join(", "));
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
