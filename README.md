@@ -82,15 +82,15 @@ bl decay --amount 25   # run daily / on schedule
 | `bl import <backlog.db> [--project N] [--dry-run] [--json]` | Copy a repo-level board into the store |
 | `bl import --stdin [--if-absent] [--by who] [--dry-run]` | File many cards at once from a JSON array or JSON lines (`{"title", "label"?, "priority"?, "notes"?, "project"?}`); prints the ids as JSON |
 | `bl migrate [--scan DIR]... [--dry-run]` | Import every repo-level board it can find |
-| `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent] [--by who]` | New card (status=new); a title over 120 characters is refused unless `--force` |
-| `bl edit <id> [--title] [--label] [--priority] [--notes] [--outcome] [--status] [--move PROJECT] [--by who] [--json]` | Change any field, all flags in one transaction |
+| `bl create "title" [-l tag,tag] [-p 0-10000] [-n notes] [--if-absent] [--by who]` | New card (status=new); a title over 120 characters is refused unless `--force` |
+| `bl edit <id> [--title] [--label tag,tag] [--add-tag T] [--rm-tag T] [--priority] [--notes] [--outcome] [--status] [--move PROJECT] [--by who] [--json]` | Change any field, all flags in one transaction |
 | `bl edit --ids 1,2,3 --priority 100` · `bl edit --where label=art --where status=new --set priority=100 [--dry-run]` | The same change on many cards; `--where` takes label, status, claimed_by, project, title with `=`/`!=` and priority, id with `< > <= >=`; every card gets its event rows |
 | `bl retitle <id> "title"` | Short for `bl edit --title` |
 | `bl delete <id> [--why "..."] [--force] [--by who]` | Remove a card; title and notes stay in `bl history <id>` (claimed cards need `--force`) |
 | `bl set-priority <id> <0-10000>` | Set priority score |
 | `bl status <id> <new\|ready\|done> [--outcome "..."] [--by who]` | Move status; an outcome over 300 characters is refused unless `--force` (put the detail in a note) |
 | `bl history <id> [--json]` | Every change the card went through: status, claim, priority, title, ... (works after delete) |
-| `bl list [-l label] [-s new,ready] [-n 30] [--json]` | List ordered by priority |
+| `bl list [-l tag[,tag]] [-s new,ready] [-n 30] [--json]` | List ordered by priority; `-l` matches a card carrying any of the tags |
 | `bl next [-l label] [--ready-only] [--json]` | Highest priority actionable card |
 | `bl show <id> [--json]` | One card |
 | `bl search <words...> [-l label] [--open] [-n 30] [--json]` | Find cards by any word in them |
@@ -105,6 +105,12 @@ bl decay --amount 25   # run daily / on schedule
 | `bl auto on\|off\|status [-o view/index.html]` | Keep a snapshot in sync after every write |
 | `bl prompt [-o FILE] [--append]` | Print agent instructions for *this* backlog |
 | `bl serve [-p 7788] [--also other.db] [--open]` | Live board view on localhost |
+
+**Tags.** A card's label is a comma-separated tag list (`-l art,enemies`; spaces work too).
+`-l art` on `list`, `next`, `search` and `board` matches any card carrying that tag, and
+`-l art,ui` any card carrying either. `bl edit --add-tag` / `--rm-tag` adjust one tag; `--label`
+replaces the set. A database written before tags has its space-separated labels split once,
+the first time this build opens it.
 
 Global flags: `--project <name>` / `BL_PROJECT` scope to a project; `--all` reads across
 active projects; `--db path` / `BL_DB` use one database file instead of the store.

@@ -79,6 +79,7 @@ CREATE TABLE cards (
     commits TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')));
 INSERT INTO cards (title, notes, priority) VALUES ('old card', 'one line of notes', 7000);
+INSERT INTO cards (title, label, priority) VALUES ('space labelled', 'art enemies c676', 6000);
 SQL
 $BL --db "$T/legacy/backlog.db" list | grep -q "old card" || fail "legacy cards unreadable after migration"
 $BL --db "$T/legacy/backlog.db" project list | grep -q "legacy" || fail "legacy project row"
@@ -113,12 +114,12 @@ ok "per-project auto export"
 cd "$T/legacy"
 git init -q .
 out=$($BL import "$T/legacy/backlog.db")
-echo "$out" | grep -q "2 card(s) imported" || fail "import count: $out"
+echo "$out" | grep -q "3 card(s) imported" || fail "import count: $out"
 new=$(echo "$out" | grep -o '#1 → #[0-9]*' | grep -o '[0-9]*$')
 $BL show "$new" | grep -q "imported: was #1" || fail "legacy id not shown"
 $BL notes "$new" | grep -q "one line of notes" || fail "legacy notes not imported"
 $BL project current | grep -q " legacy " || fail "legacy dir not registered by import"
-$BL import "$T/legacy/backlog.db" | grep -q "0 card(s) imported, 0 note(s), 2 already present" || fail "import not idempotent"
+$BL import "$T/legacy/backlog.db" | grep -q "0 card(s) imported, 0 note(s), 3 already present" || fail "import not idempotent"
 ok "import with legacy ids, idempotent"
 
 # 13. migrate scans a directory of repos; gamma's local db comes in
@@ -282,6 +283,27 @@ $BL notes "$sid" | grep -q "from a file" || fail "file body missing"
 if printf '' | $BL note "$sid" --stdin 2>/dev/null; then fail "empty stdin note accepted"; fi
 if $BL note "$sid" "text" --stdin 2>/dev/null; then fail "text and --stdin together should be refused"; fi
 ok "note --stdin / -f"
+
+# 23. tags: several per card, any-match filter everywhere, add/rm, legacy space labels split once
+cd "$T/alpha"
+t1=$($BL create "tagged one" -l "art,enemies" -p 2100 | grep -o '#[0-9]*' | tr -d '#')
+t2=$($BL create "tagged two" -l "ui enemies" -p 2000 | grep -o '#[0-9]*' | tr -d '#')
+$BL show "$t1" | grep -q "\[art,enemies\]" || fail "tags not normalized: $($BL show "$t1" | head -1)"
+$BL show "$t2" | grep -q "\[ui,enemies\]" || fail "space input not normalized: $($BL show "$t2" | head -1)"
+[ "$($BL list -l enemies --json | grep -c '"title": "tagged')" = 2 ] || fail "list -l tag any-match"
+[ "$($BL list -l art --json | grep -c '"title": "tagged')" = 1 ] || fail "list -l art"
+[ "$($BL list -l art,ui --json | grep -c '"title": "tagged')" = 2 ] || fail "list -l art,ui"
+$BL next -l enemies | grep -q "tagged one" || fail "next -l tag"
+$BL search tagged -l ui | grep -q "tagged two" || fail "search -l tag"
+$BL board --no-color -l art | grep -q "tagged one" || fail "board -l tag"
+$BL board --no-color -l art | grep -q "tagged two" && fail "board -l art matched a card without it"
+$BL edit "$t1" --add-tag build --rm-tag art | grep -q "label" || fail "edit add/rm tag"
+$BL show "$t1" | grep -q "\[enemies,build\]" || fail "add/rm result: $($BL show "$t1" | head -1)"
+$BL edit --where label=enemies --set priority=2200 | grep -q "edited 2 card(s)" || fail "--where label= is tag match"
+$BL history "$t1" | grep -q "label .*art,enemies → enemies,build" || fail "tag event"
+$BL --db "$T/legacy/backlog.db" list -l enemies | grep -q "\[art,enemies,c676\] space labelled" || fail "legacy space label not split: $($BL --db "$T/legacy/backlog.db" list)"
+$BL prompt | grep -q "Tags in use" || fail "prompt tag section"
+ok "tags"
 
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

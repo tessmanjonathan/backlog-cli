@@ -471,7 +471,7 @@
   <select id="projectpick" aria-label="Project" hidden></select>
   <div class="dbpath" id="dbpath" title=""></div>
   <div class="spacer"></div>
-  <label class="label" for="labelpick">label</label>
+  <label class="label" for="labelpick">tag</label>
   <select id="labelpick" aria-label="Filter by label"><option value="">all</option></select>
   <label class="label" for="donepick">done</label>
   <select id="donepick" aria-label="Done cards shown">
@@ -495,7 +495,7 @@
       <div class="bars" id="projectbars"></div>
     </section>
     <section class="panel">
-      <h2 class="label">Open cards by label</h2>
+      <h2 class="label">Open cards by tag</h2>
       <div class="bars" id="labelbars"></div>
     </section>
     <section class="panel">
@@ -582,9 +582,12 @@
   const inProject = () =>
     state.project ? state.cards.filter((c) => c.project === state.project) : state.cards;
 
+  // A label is a comma-separated tag list; the filter matches any one tag.
+  const tagsOf = (label) => String(label || "").split(",").map((t) => t.trim()).filter(Boolean);
+
   const visible = () => {
     let cards = inProject();
-    if (state.label) cards = cards.filter((c) => c.label === state.label);
+    if (state.label) cards = cards.filter((c) => tagsOf(c.label).includes(state.label));
     return cards;
   };
 
@@ -653,8 +656,8 @@
     const open = cards.filter((c) => c.status !== "done");
     const counts = new Map();
     for (const c of open) {
-      const k = c.label || "(none)";
-      counts.set(k, (counts.get(k) || 0) + 1);
+      const tags = tagsOf(c.label);
+      for (const k of (tags.length ? tags : ["(none)"])) counts.set(k, (counts.get(k) || 0) + 1);
     }
     const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
     const max = rows.length ? rows[0][1] : 1;
@@ -685,7 +688,7 @@
   function cardHTML(c) {
     const agentChip = c.claimed_by
       ? `<span class="chip agent">@${esc(c.claimed_by)}</span>` : "";
-    const labelChip = c.label ? `<span class="chip">${esc(c.label)}</span>` : "";
+    const labelChip = tagsOf(c.label).map((t) => `<span class="chip">${esc(t)}</span>`).join("");
     const projectChip = spanning() && c.project
       ? `<span class="chip project">${esc(c.project)}</span>` : "";
     const outcomeChip = c.status === "done" && c.outcome
@@ -750,7 +753,7 @@
         ${c.project ? `<dt>Project</dt><dd>${esc(c.project)}</dd>` : ""}
         <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}</dd>
         <dt>Priority</dt><dd style="color:${heat(c.priority)}">${c.priority}</dd>
-        <dt>Label</dt><dd>${esc(c.label || "—")}</dd>
+        <dt>Tags</dt><dd>${esc(tagsOf(c.label).join(", ") || "—")}</dd>
         <dt>Claimed</dt><dd>${c.claimed_by ? esc("@" + c.claimed_by) + " · " + esc(full(c.claimed_at)) : "—"}</dd>
         ${c.legacy_id ? `<dt>Imported</dt><dd>was #${c.legacy_id} in the repo board</dd>` : ""}
         <dt>Created</dt><dd>${esc(full(c.created_at))}</dd>
@@ -809,7 +812,7 @@
   // --- data ----------------------------------------------------------------
 
   function syncLabelPicker() {
-    const labels = [...new Set(inProject().map((c) => c.label).filter(Boolean))].sort();
+    const labels = [...new Set(inProject().flatMap((c) => tagsOf(c.label)))].sort();
     const pick = $("labelpick");
     const want = ["", ...labels].join("|");
     if (pick.dataset.sig === want) return;

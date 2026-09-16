@@ -446,7 +446,7 @@ pub(crate) fn from_stdin(ctx: &Ctx, by: &str, if_absent: bool, dry_run: bool) ->
             conn.execute(
                 "INSERT INTO cards (title, notes, label, priority, created_at, updated_at, project_id)
                  VALUES (?1, '', ?2, ?3, ?4, ?4, ?5)",
-                params![title, c.label.trim(), c.priority.unwrap_or(5000), now, project.id],
+                params![title, crate::normalize_tags(&c.label), c.priority.unwrap_or(5000), now, project.id],
             )?;
             let id = conn.last_insert_rowid();
             let notes: Vec<(String, String, String)> = match &c.notes {

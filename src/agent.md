@@ -74,8 +74,8 @@ long one — the next agent can filter them.
 | `bl claim <id> --by <agent-id>` | Lock one specific card |
 | `bl release <id> [--by <agent-id>]` | Give a claimed card back |
 | `bl show <id> [--json]` | One card in full |
-| `bl list [--label X] [--status new,ready,in_progress] [-n 30] [--json]` | Ordered by priority |
-| `bl create "title" [--label X] [--priority 0-10000] [--notes "..."] [--if-absent]` | New card (status `new`) |
+| `bl list [--label tag[,tag]] [--status new,ready,in_progress] [-n 30] [--json]` | Ordered by priority; `--label` matches any card carrying the tag |
+| `bl create "title" [--label tag,tag] [--priority 0-10000] [--notes "..."] [--if-absent]` | New card (status `new`); several tags, comma-separated |
 | `bl import --stdin [--if-absent] [--by <id>]` | File many cards in one call: pipe a JSON array or one `{"title", "label"?, "priority"?, "notes"?}` per line; ids come back as JSON |
 | `bl search <words...> [--label X] [--open] [--json]` | Find cards by any word in them |
 | `bl note <id> "text" [--kind K] [--by <id>] [--commit [REV]] [--unique]` | Add a note; `--stdin` or `-f FILE` instead of the text when it has quotes, `$` or `*` |
@@ -85,7 +85,7 @@ long one — the next agent can filter them.
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl status <id> <new\|ready\|in_progress\|done> [--outcome "..."] [--by <id>]` | Move it |
 | `bl history <id> [--json]` | Every status, claim, priority and field change, with who and when |
-| `bl edit <id> [--title] [--label] [--priority] [--outcome] [--status] [--move PROJECT]` | Change a card; `bl retitle <id> "..."` for the title alone |
+| `bl edit <id> [--title] [--label] [--add-tag T] [--rm-tag T] [--priority] [--outcome] [--status] [--move PROJECT]` | Change a card; `bl retitle <id> "..."` for the title alone |
 | `bl edit --ids 1,2,3 --priority 100` · `bl edit --where label=art --set priority=100 [--dry-run]` | Same change on many cards; `--dry-run` lists them first |
 | `bl set-priority <id> <0-10000>` | Re-rank |
 | `bl delete <id> [--why "..."]` | Remove a card filed in error (its history survives) |

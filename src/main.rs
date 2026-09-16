@@ -234,8 +234,15 @@ enum Commands {
         dry_run: bool,
         #[arg(long)]
         title: Option<String>,
+        /// Replace the tags (comma-separated)
         #[arg(long)]
         label: Option<String>,
+        /// Add a tag, keeping the others (repeatable)
+        #[arg(long, value_name = "TAG")]
+        add_tag: Vec<String>,
+        /// Remove a tag, keeping the others (repeatable)
+        #[arg(long, value_name = "TAG")]
+        rm_tag: Vec<String>,
         #[arg(long)]
         priority: Option<i32>,
         /// Replace every note on the card with this text (one note per line)
@@ -806,6 +813,25 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
         )?;
     }
 
+    // Labels became tag lists: `art enemies c676 build` is four tags, stored
+    // as `art,enemies,c676,build`. Done once per database, marked in meta.
+    if meta_get(conn, "labels_tagged")?.is_none() {
+        let legacy: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare("SELECT id, label FROM cards WHERE label != ''")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        conn.execute_batch("BEGIN;")?;
+        for (id, label) in legacy {
+            let tagged = normalize_tags(&label);
+            if tagged != label {
+                conn.execute("UPDATE cards SET label = ?1 WHERE id = ?2", params![tagged, id])?;
+            }
+        }
+        meta_set(conn, "labels_tagged", "1")?;
+        conn.execute_batch("COMMIT;")?;
+    }
+
     // A database from before projects existed holds one repository's cards.
     // Give it a project row named after the directory the file sits in, so
     // `bl import` and the views have something to attach those cards to.
@@ -1180,9 +1206,7 @@ fn agent_prompt(ctx: &Ctx) -> Result<String> {
     let labels: Vec<String> = {
         let (scope, bind) = ctx.scope();
         let mut stmt = conn.prepare(&format!(
-            "SELECT label, COUNT(*) FROM cards
-             WHERE label != '' AND status != 'done'{}
-             GROUP BY label ORDER BY COUNT(*) DESC, label ASC",
+            "SELECT label FROM cards WHERE label != '' AND status != 'done'{}",
             scope
         ))?;
         let binds: Vec<Box<dyn rusqlite::ToSql>> = match bind {
@@ -1190,17 +1214,23 @@ fn agent_prompt(ctx: &Ctx) -> Result<String> {
             None => Vec::new(),
         };
         let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(refs.as_slice(), |r| {
-            Ok(format!("{} ({})", r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        let collected: Vec<String> = rows.filter_map(|r| r.ok()).collect();
-        collected
+        let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(0))?;
+        // Counted per tag, since a card may carry several.
+        let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
+        for label in rows.filter_map(|r| r.ok()) {
+            for t in tags_of(&label) {
+                *counts.entry(t).or_default() += 1;
+            }
+        }
+        let mut pairs: Vec<(String, i64)> = counts.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        pairs.into_iter().map(|(t, n)| format!("{} ({})", t, n)).collect()
     };
     let labels = if labels.is_empty() {
         String::new()
     } else {
         format!(
-            "\n## Labels in use\n\n{}\n\nReuse one of these rather than inventing a near-duplicate.\n",
+            "\n## Tags in use\n\n{}\n\nReuse one of these rather than inventing a near-duplicate; a card may carry several (`-l art,enemies`).\n",
             labels.join(", ")
         )
     };
@@ -1289,6 +1319,8 @@ struct EditFields {
     move_to: Option<String>,
     by: String,
     force: bool,
+    add_tags: Vec<String>,
+    rm_tags: Vec<String>,
 }
 
 /// Apply every given field in one transaction. Returns the names of the
@@ -1389,7 +1421,14 @@ fn parse_where(conn: &Connection, expr: &str) -> Result<(String, Box<dyn rusqlit
             let n: i64 = v.parse().with_context(|| format!("{} '{}' is not a number", k, v))?;
             Ok((format!(" AND {} {} ?", k, op), Box::new(n)))
         }
-        "label" | "status" | "claimed_by" | "title" | "outcome" if text_ops => {
+        "label" | "tag" if text_ops => Ok((
+            format!(
+                " AND (',' || label || ',') {} ?",
+                if op == "=" { "LIKE" } else { "NOT LIKE" }
+            ),
+            Box::new(format!("%,{},%", v)),
+        )),
+        "status" | "claimed_by" | "title" | "outcome" if text_ops => {
             Ok((format!(" AND {} {} ?", k, op), Box::new(v.to_string())))
         }
         "project" if text_ops => {
@@ -1451,9 +1490,25 @@ fn bulk_edit(ctx: &Ctx, ids: &[i64], f: &EditFields) -> Result<Vec<String>> {
 /// Every field of one edit, inside the caller's transaction. Returns the
 /// names of the fields that changed and whether the card moved project.
 fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(Vec<String>, bool)> {
+    let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
     let mut sets: Vec<String> = Vec::new();
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
+
+    // Tags: --label replaces, --add-tag / --rm-tag adjust what is there.
+    let new_label: Option<String> = if f.label.is_some() || !f.add_tags.is_empty() || !f.rm_tags.is_empty() {
+        let mut tags = tags_of(f.label.as_deref().unwrap_or(&old.label));
+        for t in f.add_tags.iter().flat_map(|t| tags_of(t)) {
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
+        let drop: Vec<String> = f.rm_tags.iter().flat_map(|t| tags_of(t)).collect();
+        tags.retain(|t| !drop.contains(t));
+        Some(tags.join(","))
+    } else {
+        None
+    };
 
     if let Some(t) = &f.title {
         check_title(t, f.force)?;
@@ -1461,9 +1516,9 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
         binds.push(Box::new(t.trim().to_string()));
         changed.push("title".into());
     }
-    if let Some(l) = &f.label {
+    if let Some(l) = &new_label {
         sets.push("label = ?".into());
-        binds.push(Box::new(l.trim().to_string()));
+        binds.push(Box::new(l.clone()));
         changed.push("label".into());
     }
     if let Some(p) = f.priority {
@@ -1503,11 +1558,10 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
         changed.push("notes".into());
     }
     if changed.is_empty() {
-        bail!("nothing to change: give at least one of --title --label --priority --notes --outcome --status --move");
+        bail!("nothing to change: give at least one of --title --label --add-tag --rm-tag --priority --notes --outcome --status --move");
     }
 
     {
-        let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
         if !sets.is_empty() {
             sets.push("updated_at = ?".into());
             binds.push(Box::new(now.to_string()));
@@ -1547,8 +1601,8 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
         if let Some(t) = &f.title {
             ev("title", &old.title, t.trim())?;
         }
-        if let Some(l) = &f.label {
-            ev("label", &old.label, l.trim())?;
+        if let Some(l) = &new_label {
+            ev("label", &old.label, l)?;
         }
         if let Some(p) = f.priority {
             ev("priority", &old.priority.to_string(), &p.to_string())?;
@@ -1573,6 +1627,40 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
         }
     }
     Ok((changed, moved.is_some()))
+}
+
+// ---------------------------------------------------------------- tags
+
+/// A card's label is a comma-separated list of tags. Input may use commas or
+/// spaces; the stored form is `a,b,c` with no blanks and no repeats.
+pub(crate) fn tags_of(label: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in label.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = t.trim();
+        if !t.is_empty() && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+pub(crate) fn normalize_tags(label: &str) -> String {
+    tags_of(label).join(",")
+}
+
+/// `-l art` or `-l art,ui`: a card matches when it carries any of the tags.
+/// Returns the clause (starting with ` AND `) and its binds.
+pub(crate) fn tag_clause(filter: &str) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let tags = tags_of(filter);
+    if tags.is_empty() {
+        return (" AND label = ''".to_string(), Vec::new());
+    }
+    let ors: Vec<&str> = tags.iter().map(|_| "(',' || label || ',') LIKE ?").collect();
+    let binds: Vec<Box<dyn rusqlite::ToSql>> = tags
+        .iter()
+        .map(|t| Box::new(format!("%,{},%", t)) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    (format!(" AND ({})", ors.join(" OR ")), binds)
 }
 
 // ---------------------------------------------------------------- guards
@@ -1950,6 +2038,7 @@ fn main() -> Result<()> {
             }
             check_title(&title, force)?;
             let title = title.trim().to_string();
+            let label = normalize_tags(&label);
             let project = ctx.require_project()?;
             let now = now_str();
 
@@ -1992,6 +2081,8 @@ fn main() -> Result<()> {
             dry_run,
             title,
             label,
+            add_tag,
+            rm_tag,
             priority,
             notes: notes_text,
             outcome,
@@ -2011,6 +2102,8 @@ fn main() -> Result<()> {
                 move_to: r#move,
                 by: by.unwrap_or_default(),
                 force,
+                add_tags: add_tag,
+                rm_tags: rm_tag,
             };
             for pair in &set {
                 parse_set(&mut fields, pair)?;
@@ -2304,8 +2397,9 @@ fn main() -> Result<()> {
             }
 
             if let Some(l) = &label {
-                sql.push_str(" AND label = ?");
-                binds.push(Box::new(l.clone()));
+                let (clause, tag_binds) = tag_clause(l);
+                sql.push_str(&clause);
+                binds.extend(tag_binds);
             }
 
             if let Some(s) = &status {
@@ -2381,8 +2475,9 @@ fn main() -> Result<()> {
                     binds.push(Box::new(pid));
                 }
                 if let Some(l) = &label {
-                    sql.push_str(" AND label = ?");
-                    binds.push(Box::new(l.clone()));
+                    let (clause, tag_binds) = tag_clause(l);
+                    sql.push_str(&clause);
+                    binds.extend(tag_binds);
                 }
                 sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT 1");
 
@@ -2451,8 +2546,9 @@ fn main() -> Result<()> {
                     binds.push(Box::new(pid));
                 }
                 if let Some(l) = &label {
-                    sql.push_str(" AND label = ?");
-                    binds.push(Box::new(l.clone()));
+                    let (clause, tag_binds) = tag_clause(l);
+                    sql.push_str(&clause);
+                    binds.extend(tag_binds);
                 }
                 sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT 1");
 
@@ -2711,8 +2807,9 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(l) = &label {
-                sql.push_str(" AND label = ?");
-                binds.push(Box::new(l.clone()));
+                let (clause, tag_binds) = tag_clause(l);
+                sql.push_str(&clause);
+                binds.extend(tag_binds);
             }
             if open {
                 sql.push_str(" AND status != 'done'");

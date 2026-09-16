@@ -197,7 +197,11 @@ pub fn render(title: &str, all: &[Card], opts: &Opts) -> String {
     let cards: Vec<&Card> = all
         .iter()
         .filter(|c| match &opts.label {
-            Some(l) => &c.label == l,
+            Some(l) => {
+                let want = crate::tags_of(l);
+                let have = crate::tags_of(&c.label);
+                want.iter().any(|t| have.contains(t))
+            }
             None => true,
         })
         .collect();
@@ -258,15 +262,19 @@ fn header(title: &str, cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> Str
 fn panels(cards: &[&Card], p: &Paint, w: usize) -> String {
     let open: Vec<&&Card> = cards.iter().filter(|c| c.status != "done").collect();
 
-    // Open cards by label
-    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    // Open cards by tag (a card with several counts under each)
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     for c in &open {
-        *counts
-            .entry(if c.label.is_empty() { "(none)" } else { &c.label })
-            .or_default() += 1;
+        let tags = crate::tags_of(&c.label);
+        if tags.is_empty() {
+            *counts.entry("(none)".to_string()).or_default() += 1;
+        }
+        for t in tags {
+            *counts.entry(t).or_default() += 1;
+        }
     }
-    let mut rows: Vec<(&str, usize)> = counts.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     rows.truncate(6);
     let max = rows.first().map(|r| r.1).unwrap_or(1).max(1);
 
@@ -274,7 +282,7 @@ fn panels(cards: &[&Card], p: &Paint, w: usize) -> String {
     let bar_w = w.saturating_sub(name_w + 8).min(40);
 
     let mut s = String::new();
-    s.push_str(&p.dim("OPEN BY LABEL"));
+    s.push_str(&p.dim("OPEN BY TAG"));
     s.push('\n');
     if rows.is_empty() {
         s.push_str(&p.dim("  nothing open\n"));
