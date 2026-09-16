@@ -392,5 +392,16 @@ cd "$T/nowhere-$$" 2>/dev/null || mkdir -p "$T/nowhere" && cd "$T/nowhere"
 BL_HOME="$T/empty-home" $BL --version | grep -q "database: none found" || fail "no-db case: $(BL_HOME="$T/empty-home" $BL --version)"
 ok "--version / schema stamp"
 
+# 27. -n is the limit; a numeric -l that matches nothing says so
+cd "$T/alpha"
+$BL list --help | grep -q -- "-n, --limit <N>" || fail "list --help lacks -n/--limit"
+$BL list --help | grep -q "Not a count: that is -n" || fail "list --help does not warn about -l"
+$BL prompt | grep -q -- "-n\`/\`--limit\` is the count" || fail "prompt does not name -n"
+[ "$($BL list -n 2 | grep -c '^#')" = 2 ] || fail "-n 2 did not cap"
+$BL list -l 5 2>&1 >/dev/null | grep -q "no card carries the tag '5'; to cap the count use -n 5" || fail "numeric -l warning: $($BL list -l 5 2>&1)"
+$BL list -l art 2>&1 >/dev/null | grep -q "to cap the count" && fail "warned for a word tag"
+$BL next -l 7 2>&1 >/dev/null | grep -q "use -n 7" || fail "next lacks the warning"
+ok "-n limit / numeric -l warning"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

@@ -419,15 +419,16 @@ enum Commands {
         by: Option<String>,
     },
 
-    /// List cards (filter by label / status, ordered by priority)
+    /// List cards (filter by tag / status, ordered by priority; -n caps the count)
     List {
-        #[arg(short, long)]
+        /// Only cards carrying this tag (or any of `a,b`). Not a count: that is -n
+        #[arg(short, long, value_name = "TAG")]
         label: Option<String>,
         /// Comma-separated statuses (e.g. new,ready,in_progress). Default: all non-done
         #[arg(short, long)]
         status: Option<String>,
-        /// `-l` is taken by --label, so the limit is `-n`.
-        #[arg(short = 'n', long, default_value_t = 30)]
+        /// How many cards to print
+        #[arg(short = 'n', long, default_value_t = 30, value_name = "N")]
         limit: i64,
         /// Output as JSON
         #[arg(long)]
@@ -436,7 +437,8 @@ enum Commands {
 
     /// Highest-priority actionable card. With --claim, atomically claims it.
     Next {
-        #[arg(short, long)]
+        /// Only cards carrying this tag (or any of `a,b`)
+        #[arg(short, long, value_name = "TAG")]
         label: Option<String>,
         /// Prefer only 'ready' cards (skip 'new')
         #[arg(long)]
@@ -1842,6 +1844,19 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
 
 // ---------------------------------------------------------------- tags
 
+/// `bl list -l 5` almost always meant `-n 5`. Say so when the tag is all
+/// digits and matched nothing, instead of printing an empty board.
+fn warn_numeric_label(label: Option<&str>, matched: usize) {
+    if let Some(l) = label {
+        if matched == 0 && !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) {
+            eprintln!(
+                "bl: -l/--label filters by tag and no card carries the tag '{}'; to cap the count use -n {}",
+                l, l
+            );
+        }
+    }
+}
+
 /// A card's label is a comma-separated list of tags. Input may use commas or
 /// spaces; the stored form is `a,b,c` with no blanks and no repeats.
 pub(crate) fn tags_of(label: &str) -> Vec<String> {
@@ -2708,6 +2723,7 @@ fn main() -> Result<()> {
                 .filter_map(|r| r.ok())
                 .collect();
             load_links(conn, &mut cards);
+            warn_numeric_label(label.as_deref(), cards.len());
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&cards)?);
@@ -2770,6 +2786,7 @@ fn main() -> Result<()> {
 
                 let Some((id, prev_status)) = picked else {
                     conn.execute_batch("ROLLBACK;")?;
+                    warn_numeric_label(label.as_deref(), 0);
                     if json {
                         println!("null");
                     } else {
@@ -2850,6 +2867,7 @@ fn main() -> Result<()> {
                         print_card(&c, json, multi);
                     }
                     None => {
+                        warn_numeric_label(label.as_deref(), 0);
                         if json {
                             println!("null");
                         } else {

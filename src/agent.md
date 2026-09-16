@@ -74,7 +74,7 @@ long one — the next agent can filter them.
 | `bl claim <id> --by <agent-id>` | Lock one specific card |
 | `bl release <id> [--by <agent-id>]` | Give a claimed card back |
 | `bl show <id> [--json]` | One card in full |
-| `bl list [--label tag[,tag]] [--status new,ready,in_progress] [-n 30] [--json]` | Ordered by priority; `--label` matches any card carrying the tag |
+| `bl list [--label tag[,tag]] [--status new,ready,in_progress] [-n N] [--json]` | Ordered by priority; `-l` is a tag filter, `-n`/`--limit` is the count (default 30) |
 | `bl create "title" [--label tag,tag] [--priority 0-10000] [--notes "..."] [--if-absent]` | New card (status `new`); several tags, comma-separated |
 | `bl import --stdin [--if-absent] [--by <id>]` | File many cards in one call: pipe a JSON array or one `{"title", "label"?, "priority"?, "notes"?}` per line; ids come back as JSON |
 | `bl search <words...> [--label X] [--open] [--json]` | Find cards by any word in them |

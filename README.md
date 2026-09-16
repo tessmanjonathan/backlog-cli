@@ -92,7 +92,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl status <id> <new\|ready\|in_progress\|blocked\|done> [--outcome "..."] [--on WHO\|#ID] [--by who]` | Move status; `blocked --on <who or #card>` parks a card (skipped by `next` and `reap`, shown with its reason; `--on #12` also links #12 as a blocker); an outcome over 300 characters is refused unless `--force` |
 | `bl history <id> [--json]` | Every change the card went through: status, claim, priority, title, ... (works after delete) |
 | `bl link <id> [--blocks ID] [--child-of ID] [--related ID]` · `bl unlink` (same flags) · `bl block <id> --on ID` | Relate cards; a card with an open blocker is skipped by `bl next` and says `blocked by` wherever it is printed |
-| `bl list [-l tag[,tag]] [-s new,ready] [-n 30] [--json]` | List ordered by priority; `-l` matches a card carrying any of the tags |
+| `bl list [-l tag[,tag]] [-s new,ready] [-n N] [--json]` | List ordered by priority; `-l` matches a card carrying any of the tags, `-n`/`--limit` caps the count (a numeric `-l` that matches nothing gets a warning) |
 | `bl next [-l label] [--ready-only] [--json]` | Highest priority actionable card |
 | `bl show <id> [--json]` | One card |
 | `bl search <words...> [-l label] [--open] [-n 30] [--json]` | Find cards by any word in them |
