@@ -1,9 +1,12 @@
 # Backlog (`bl`)
 
-Local SQLite Kanban board. This project's backlog: `{{DB}}`
+Local SQLite Kanban board. The store: `{{DB}}`
+{{PROJECT}}
 {{AUTO}}
-Pass `--db <path>` (or set `BL_DB`) to work against a different backlog. An absolute
-`BL_DB` is shared across worktrees, so parallel agents see one board.
+Every project shares the one store, so a card id is unique everywhere and `bl next` from a
+directory outside any project reads across all active ones. `--project <name>` (or
+`BL_PROJECT`) scopes a command by hand; `--all` reads every active project from inside one.
+`--db <path>` (or `BL_DB`) works against a different database file entirely.
 
 ## Loop
 

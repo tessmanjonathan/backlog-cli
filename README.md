@@ -11,9 +11,39 @@ cd backlog-cli
 cargo build --release
 cp target/release/bl ~/bin/bl   # or /usr/local/bin/bl
 
-# in a project
-bl init   # safe to re-run; migrates existing backlog.db
+# once: create the central store under ~/.bl and register this repository
+cd ~/git/myproject
+bl init
+
+# every other repository: register it
+cd ~/git/other && bl project add
 ```
+
+## One store, many projects
+
+Every project's cards live in one database, `~/.bl/backlog.db` (the `db:` key in
+`~/.bl/config.yml` moves it). A `projects` table maps each repository path to a project,
+and a command run anywhere inside that repository, including any of its git worktrees, is
+scoped to that project without a flag. Card ids are unique across the store.
+
+```bash
+bl project add [path] [--name N]   # register a repository (default: the one you are in)
+bl project list                    # every project, active flag, open card count
+bl project current                 # what this directory resolves to
+bl project deactivate experiments  # skipped by bl next, hidden from the default views
+bl project activate experiments
+bl project remove old [--force]    # --force deletes its cards too
+```
+
+From a directory outside any project, `bl next`, `bl list`, `bl board` and `bl export` read
+across every active project and name the project on each card. Inside one, `--all` does the
+same. `--project <name>` (or `BL_PROJECT`) picks a project by hand from anywhere.
+
+`bl` never creates a database by accident: only `bl init` does. A directory with no store and
+no `./backlog.db` gets an error, not an empty board. `--db <path>` (or `BL_DB`) still works
+against one file, and `bl init --db path` creates one; such a file gets a single project row
+named after its directory the first time this build opens it. A repository that still carries
+its own `./backlog.db` and is not registered keeps using that file, with a hint on stderr.
 
 ## Quick start
 
@@ -33,7 +63,8 @@ bl decay --amount 25   # run daily / on schedule
 
 | Command | Purpose |
 |---------|---------|
-| `bl init` | Create `backlog.db` + schema |
+| `bl init` | Create the central store and register this repository (`--db` for one file) |
+| `bl project add\|list\|current\|activate\|deactivate\|remove` | Which repositories share the store |
 | `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent]` | New card (status=new) |
 | `bl set-priority <id> <0-10000>` | Set priority score |
 | `bl status <id> <new\|ready\|done> [--outcome "..."]` | Move status |
@@ -52,7 +83,9 @@ bl decay --amount 25   # run daily / on schedule
 | `bl prompt [-o FILE] [--append]` | Print agent instructions for *this* backlog |
 | `bl serve [-p 7788] [--also other.db] [--open]` | Live board view on localhost |
 
-Env / flag: `BL_DB` or `--db path` overrides the database location (default `./backlog.db`).
+Global flags: `--project <name>` / `BL_PROJECT` scope to a project; `--all` reads across
+active projects; `--db path` / `BL_DB` use one database file instead of the store.
+`BL_HOME` moves the whole `~/.bl` directory.
 
 ## Keeping the snapshot live
 
@@ -71,7 +104,9 @@ the file as a side effect — no separate step in the agent loop, nothing to rem
 write is atomic (temp file + rename), so a reload never catches a half-written page, and a
 failed refresh warns on stderr without failing the command that already committed.
 
-The path is stored in the database, so it follows the backlog rather than the shell.
+The path is stored per project when run inside one, and store-wide when run from outside
+(that page shows every active project). A write refreshes the touched project's page and the
+store-wide page.
 `BL_AUTOEXPORT=path` overrides it for one command; `BL_NO_AUTOEXPORT=1` suppresses the
 refresh (useful for bulk imports — run `bl export` once at the end).
 
