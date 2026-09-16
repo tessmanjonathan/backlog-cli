@@ -232,6 +232,20 @@ enum Commands {
     /// Change a card's title (short for `bl edit <id> --title`)
     Retitle { id: i64, title: String },
 
+    /// Remove a card created in error. Its title and notes stay in `bl history`.
+    Delete {
+        id: i64,
+        /// Why it goes, kept on the deleted event
+        #[arg(long)]
+        why: Option<String>,
+        /// Delete even if an agent holds the claim
+        #[arg(long)]
+        force: bool,
+        /// Who is deleting, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+
     /// Set priority score (0-10000)
     #[command(name = "set-priority")]
     SetPriority {
@@ -1388,6 +1402,45 @@ fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
     Ok(changed)
 }
 
+// ---------------------------------------------------------------- delete
+
+/// Remove one card and its notes inside the caller's transaction, leaving a
+/// `deleted` event that carries everything the card said so `bl history`
+/// can still show it. Refuses a claimed card unless `force`.
+fn delete_card(conn: &Connection, id: i64, why: &str, force: bool, by: &str, now: &str) -> Result<Snapshot> {
+    let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+    if !old.claimed_by.is_empty() && !force {
+        bail!(
+            "card #{} is claimed by '{}'; `bl release {}` first, or --force",
+            id, old.claimed_by, id
+        );
+    }
+    notes::reconcile(conn, id)?;
+    let mut payload = format!(
+        "title: {}\nstatus: {}\npriority: {}",
+        old.title, old.status, old.priority
+    );
+    if !old.label.is_empty() {
+        payload.push_str(&format!("\nlabel: {}", old.label));
+    }
+    if !old.outcome.is_empty() {
+        payload.push_str(&format!("\noutcome: {}", old.outcome));
+    }
+    for n in notes::list(conn, id)? {
+        payload.push_str(&format!(
+            "\nnote {} [{}]{}: {}",
+            n.created_at,
+            n.kind,
+            if n.author.is_empty() { String::new() } else { format!(" {}", n.author) },
+            n.body
+        ));
+    }
+    events::record(conn, id, Some(old.project_id), "deleted", &payload, why, by, now)?;
+    conn.execute("DELETE FROM notes WHERE card_id = ?", params![id])?;
+    conn.execute("DELETE FROM cards WHERE id = ?", params![id])?;
+    Ok(old)
+}
+
 // ---------------------------------------------------------------- init
 
 /// The only command that creates a database. Without `--db` it creates the
@@ -1567,16 +1620,18 @@ fn project_cmd(ctx: &Ctx, action: ProjectAction) -> Result<()> {
                     total
                 );
             }
-            conn.execute_batch("BEGIN;")?;
-            if total > 0 {
-                conn.execute(
-                    "DELETE FROM notes WHERE card_id IN (SELECT id FROM cards WHERE project_id = ?)",
-                    params![p.id],
-                )?;
-                conn.execute("DELETE FROM cards WHERE project_id = ?", params![p.id])?;
-            }
-            store::remove(conn, p.id)?;
-            conn.execute_batch("COMMIT;")?;
+            let now = now_str();
+            transaction(conn, || {
+                let ids: Vec<i64> = {
+                    let mut stmt = conn.prepare("SELECT id FROM cards WHERE project_id = ? ORDER BY id")?;
+                    let rows = stmt.query_map(params![p.id], |r| r.get(0))?;
+                    rows.filter_map(|r| r.ok()).collect()
+                };
+                for id in ids {
+                    delete_card(conn, id, &format!("project '{}' removed", p.name), true, "", &now)?;
+                }
+                store::remove(conn, p.id)
+            })?;
             println!("removed project '{}' ({} card(s) deleted)", p.name, total);
         }
     }
@@ -1754,6 +1809,15 @@ fn main() -> Result<()> {
                 },
             )?;
             println!("#{} retitled: {}", id, title);
+        }
+
+        Commands::Delete { id, why, force, by } => {
+            let now = now_str();
+            let old = transaction(conn, || {
+                delete_card(conn, id, why.as_deref().unwrap_or(""), force, by.as_deref().unwrap_or(""), &now)
+            })?;
+            println!("#{} deleted: {}  (bl history {} keeps its notes)", id, old.title, id);
+            refresh_views(&ctx, None);
         }
 
         Commands::SetPriority { id, priority, by } => {

@@ -84,6 +84,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent]` | New card (status=new) |
 | `bl edit <id> [--title] [--label] [--priority] [--notes] [--outcome] [--status] [--move PROJECT] [--by who] [--json]` | Change any field, all flags in one transaction |
 | `bl retitle <id> "title"` | Short for `bl edit --title` |
+| `bl delete <id> [--why "..."] [--force] [--by who]` | Remove a card; title and notes stay in `bl history <id>` (claimed cards need `--force`) |
 | `bl set-priority <id> <0-10000>` | Set priority score |
 | `bl status <id> <new\|ready\|done> [--outcome "..."] [--by who]` | Move status |
 | `bl history <id> [--json]` | Every change the card went through: status, claim, priority, title, ... (works after delete) |

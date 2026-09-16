@@ -82,6 +82,7 @@ long one — the next agent can filter them.
 | `bl history <id> [--json]` | Every status, claim, priority and field change, with who and when |
 | `bl edit <id> [--title] [--label] [--priority] [--outcome] [--status] [--move PROJECT]` | Change a card; `bl retitle <id> "..."` for the title alone |
 | `bl set-priority <id> <0-10000>` | Re-rank |
+| `bl delete <id> [--why "..."]` | Remove a card filed in error (its history survives) |
 | `bl decay [--amount 25]` | Age everything down (scheduled, not per-task) |
 | `bl board`, `bl serve`, `bl export` | Human views — you rarely need these |
 
@@ -102,9 +103,10 @@ are parsing rather than reading.
 7. Discovered extra work? `bl create` a follow-up. Don't quietly widen the card you hold.
 8. Status flow: `new → ready → in_progress → done`.
 9. Never run `bl export` in a loop — the view pages keep themselves current.
-10. A wrong title, label or priority is fixed with `bl edit` / `bl retitle`. Never open the
-    database with sqlite3: `bl` mirrors notes into a legacy column and re-adopts rows, and a
-    direct write skips both.
+10. A wrong title, label or priority is fixed with `bl edit` / `bl retitle`; a card filed in
+    error goes with `bl delete <id> --why "..."`. Never open the database with sqlite3: `bl`
+    mirrors notes into a legacy column, re-adopts rows and logs events, and a direct write
+    skips all three.
 
 ## Fan-out
 

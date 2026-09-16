@@ -182,5 +182,21 @@ $BL export -o "$T/hist.html" >/dev/null; grep -q '"events":\[' "$T/hist.html" ||
 if $BL history 99999 2>/dev/null; then fail "history of a missing card should fail"; fi
 ok "event log / bl history"
 
+# 17. delete: notes travel into the deleted event; a claimed card needs --force
+cd "$T/alpha"
+did=$($BL create "filed by mistake" -l oops | grep -o '#[0-9]*' | tr -d '#')
+$BL note "$did" "this note must survive in history" -k finding --by noter >/dev/null
+$BL claim "$did" --by holder >/dev/null
+if $BL delete "$did" 2>/dev/null; then fail "delete of a claimed card without --force"; fi
+$BL show "$did" >/dev/null || fail "refused delete still removed the card"
+$BL delete "$did" --force --why "duplicate of #1" --by janitor | grep -q "deleted: filed by mistake" || fail "delete output"
+if $BL show "$did" 2>/dev/null; then fail "card still there after delete"; fi
+h=$($BL history "$did")
+echo "$h" | grep -q "deleted .*title: filed by mistake" || fail "deleted event lacks title: $h"
+echo "$h" | grep -q "this note must survive in history" || fail "deleted event lacks notes: $h"
+echo "$h" | grep -q "→ duplicate of #1  by janitor" || fail "deleted event lacks why/by: $h"
+[ "$($BL history "$did" --json | grep -c '"kind": "deleted"')" = 1 ] || fail "deleted event count"
+ok "delete keeps history"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"
