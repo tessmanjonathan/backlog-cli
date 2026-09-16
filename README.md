@@ -90,6 +90,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl set-priority <id> <0-10000>` | Set priority score |
 | `bl status <id> <new\|ready\|done> [--outcome "..."] [--by who]` | Move status; an outcome over 300 characters is refused unless `--force` (put the detail in a note) |
 | `bl history <id> [--json]` | Every change the card went through: status, claim, priority, title, ... (works after delete) |
+| `bl link <id> [--blocks ID] [--child-of ID] [--related ID]` · `bl unlink` (same flags) · `bl block <id> --on ID` | Relate cards; a card with an open blocker is skipped by `bl next` and says `blocked by` wherever it is printed |
 | `bl list [-l tag[,tag]] [-s new,ready] [-n 30] [--json]` | List ordered by priority; `-l` matches a card carrying any of the tags |
 | `bl next [-l label] [--ready-only] [--json]` | Highest priority actionable card |
 | `bl show <id> [--json]` | One card |

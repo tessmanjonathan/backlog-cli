@@ -305,5 +305,31 @@ $BL --db "$T/legacy/backlog.db" list -l enemies | grep -q "\[art,enemies,c676\] 
 $BL prompt | grep -q "Tags in use" || fail "prompt tag section"
 ok "tags"
 
+# 24. links: blocks keeps a card out of next until the blocker is done; child_of / related; unlink; cycles refused
+cd "$T/alpha"
+l1=$($BL create "dep first" -p 9800 | grep -o '#[0-9]*' | tr -d '#')
+l2=$($BL create "dep second" -p 9900 | grep -o '#[0-9]*' | tr -d '#')
+ep=$($BL create "dep epic" -p 100 | grep -o '#[0-9]*' | tr -d '#')
+$BL next | grep -q "dep second" || fail "precondition: second is top"
+$BL block "$l2" --on "$l1" --by planner | grep -q "linked: #$l1 blocks #$l2" || fail "block --on"
+$BL next | grep -q "dep first" || fail "next did not skip the blocked card"
+$BL show "$l2" | grep -q "blocked by: #$l1 (new) dep first" || fail "show lacks blocked by: $($BL show "$l2")"
+$BL list | grep -q "blocks: #$l2 dep second" || fail "list lacks blocks line"
+$BL show "$l2" --json | grep -q '"rel": "blocked_by"' || fail "json links"
+if $BL link "$l2" --blocks "$l1" 2>/dev/null; then fail "cycle accepted"; fi
+$BL link "$l1" --child-of "$ep" --related "$l2" >/dev/null || fail "child-of/related"
+$BL show "$ep" | grep -q "children: #$l1" || fail "epic children"
+$BL show "$l2" | grep -q "related: #$l1" || fail "related is symmetric"
+$BL link "$l1" --child-of "$ep" | grep -q "already linked" || fail "duplicate link"
+$BL history "$l2" | grep -q "link .*→ #$l1 blocks #$l2  by planner" || fail "link event: $($BL history "$l2")"
+nid=$($BL next --claim --by dep | grep -o '#[0-9]*' | head -1 | tr -d '#'); [ "$nid" = "$l1" ] || fail "next --claim picked $nid not the blocker"
+$BL status "$l1" done --outcome "done" >/dev/null
+$BL next | grep -q "dep second" || fail "done blocker still blocks"
+$BL export -o "$T/links.html" >/dev/null; grep -q '"links":\[' "$T/links.html" || fail "page carries no links"
+$BL unlink "$l1" --related "$l2" | grep -q "unlinked" || fail "unlink"
+$BL show "$l2" | grep -q "related:" && fail "related survived unlink"
+$BL delete "$l1" --why test >/dev/null; $BL show "$l2" | grep -q "blocked by" && fail "link survived delete of the blocker"
+ok "links / block"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

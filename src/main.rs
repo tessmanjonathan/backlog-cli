@@ -1,11 +1,13 @@
 mod board;
 mod events;
 mod import;
+mod links;
 mod notes;
 mod store;
 mod view;
 
 use events::Event;
+use links::Rel;
 use notes::Note;
 use store::Project;
 
@@ -104,6 +106,21 @@ CREATE TABLE IF NOT EXISTS events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_card ON events(card_id, id);
+
+-- Relations between cards. `from blocks to` keeps `to` out of bl next until
+-- `from` is done; `from child_of to` groups work under an epic; `related` is
+-- a cross-reference stored once, lowest id first.
+CREATE TABLE IF NOT EXISTS links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id     INTEGER NOT NULL,
+    kind        TEXT NOT NULL CHECK(kind IN ('blocks', 'child_of', 'related')),
+    to_id       INTEGER NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(from_id, kind, to_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_to ON links(to_id, kind);
 "#;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -311,6 +328,46 @@ enum Commands {
         /// Accept an outcome over 300 characters anyway
         #[arg(long)]
         force: bool,
+    },
+
+    /// Relate two cards: `bl link 12 --blocks 14`, `--child-of 3`, `--related 9`
+    Link {
+        id: i64,
+        /// This card must be done before the other can be picked by bl next
+        #[arg(long, value_name = "ID")]
+        blocks: Vec<i64>,
+        /// Group this card under an epic
+        #[arg(long, value_name = "ID")]
+        child_of: Vec<i64>,
+        /// A plain cross-reference
+        #[arg(long, value_name = "ID")]
+        related: Vec<i64>,
+        /// Who is linking, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Remove a relation made with bl link (same flags)
+    Unlink {
+        id: i64,
+        #[arg(long, value_name = "ID")]
+        blocks: Vec<i64>,
+        #[arg(long, value_name = "ID")]
+        child_of: Vec<i64>,
+        #[arg(long, value_name = "ID")]
+        related: Vec<i64>,
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Park a card behind another: `bl block 14 --on 12` = `bl link 12 --blocks 14`
+    Block {
+        id: i64,
+        /// The card that has to be done first
+        #[arg(long, value_name = "ID", required = true)]
+        on: Vec<i64>,
+        #[arg(long)]
+        by: Option<String>,
     },
 
     /// Replay every change a card went through (works for deleted cards too)
@@ -906,6 +963,9 @@ pub(crate) struct Card {
     /// The audit trail, oldest first. Filled with `entries`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) events: Vec<Event>,
+    /// What this card waits on, blocks, belongs to, owns or relates to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) links: Vec<Rel>,
 }
 
 pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
@@ -927,6 +987,7 @@ pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         legacy_id: row.get::<_, Option<i64>>(14).unwrap_or(None),
         entries: Vec::new(),
         events: Vec::new(),
+        links: Vec::new(),
     })
 }
 
@@ -942,6 +1003,18 @@ pub(crate) fn load_entries(conn: &Connection, cards: &mut [Card]) {
         if has_events {
             c.events = events::list(conn, c.id).unwrap_or_default();
         }
+    }
+    load_links(conn, cards);
+}
+
+/// Fill in each card's relations (cheap; done for text listings too, so a
+/// card that waits on another says so wherever it is printed).
+pub(crate) fn load_links(conn: &Connection, cards: &mut [Card]) {
+    if !links::table_exists(conn) {
+        return;
+    }
+    for c in cards.iter_mut() {
+        c.links = links::of(conn, c.id).unwrap_or_default();
     }
 }
 
@@ -1000,6 +1073,23 @@ fn print_card(c: &Card, json: bool, show_project: bool) {
         }
         if let Some(old) = c.legacy_id {
             println!("    imported: was #{} in {}'s own backlog.db", old, c.project);
+        }
+        for rel in ["blocked_by", "blocks", "child_of", "parent_of", "related"] {
+            let items: Vec<String> = c
+                .links
+                .iter()
+                .filter(|l| l.rel == rel)
+                .map(|l| {
+                    if rel == "blocked_by" {
+                        format!("#{} ({}) {}", l.id, l.status, l.title)
+                    } else {
+                        format!("#{} {}", l.id, l.title)
+                    }
+                })
+                .collect();
+            if !items.is_empty() {
+                println!("    {}: {}", links::label(rel), items.join(", "));
+            }
         }
         for line in c.commits.lines().filter(|l| !l.trim().is_empty()) {
             let (sha, subject) = line.split_once('\t').unwrap_or((line, ""));
@@ -1663,6 +1753,56 @@ pub(crate) fn tag_clause(filter: &str) -> (String, Vec<Box<dyn rusqlite::ToSql>>
     (format!(" AND ({})", ors.join(" OR ")), binds)
 }
 
+// ---------------------------------------------------------------- links
+
+/// Add or remove relations, one event per card touched, all in one
+/// transaction. Nothing to do at all is an error, so a typo does not exit 0.
+fn link_cmd(ctx: &Ctx, triples: &[(i64, &str, i64)], add: bool, by: &str) -> Result<()> {
+    let conn = &ctx.conn;
+    if triples.is_empty() {
+        bail!("say how they relate: --blocks <id>, --child-of <id> or --related <id>");
+    }
+    let now = now_str();
+    let mut touched: Vec<i64> = Vec::new();
+    transaction(conn, || {
+        for (from, kind, to) in triples {
+            let describe = |a: i64, b: i64| -> String {
+                match *kind {
+                    "blocks" => format!("#{} blocks #{}", a, b),
+                    "child_of" => format!("#{} child of #{}", a, b),
+                    _ => format!("#{} related to #{}", a, b),
+                }
+            };
+            let did = if add {
+                links::add(conn, *from, kind, *to, by, &now)?
+            } else {
+                links::remove(conn, *from, kind, *to)?
+            };
+            let what = describe(*from, *to);
+            if !did {
+                println!("{}: {}", if add { "already linked" } else { "no such link" }, what);
+                continue;
+            }
+            for card in [*from, *to] {
+                events::record(
+                    conn, card, None,
+                    if add { "link" } else { "unlink" },
+                    if add { "" } else { &what },
+                    if add { &what } else { "" },
+                    by, &now,
+                )?;
+                touched.push(card);
+            }
+            println!("{}: {}", if add { "linked" } else { "unlinked" }, what);
+        }
+        Ok(())
+    })?;
+    if !touched.is_empty() {
+        refresh_views(ctx, None);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- guards
 
 /// Titles and outcomes are headlines; the detail belongs in notes. Boards
@@ -1731,6 +1871,7 @@ fn delete_card(conn: &Connection, id: i64, why: &str, force: bool, by: &str, now
         ));
     }
     events::record(conn, id, Some(old.project_id), "deleted", &payload, why, by, now)?;
+    links::drop_all(conn, id)?;
     conn.execute("DELETE FROM notes WHERE card_id = ?", params![id])?;
     conn.execute("DELETE FROM cards WHERE id = ?", params![id])?;
     Ok(old)
@@ -2426,10 +2567,11 @@ fn main() -> Result<()> {
             let mut stmt = conn.prepare(&sql)?;
             let params_ref: Vec<&dyn rusqlite::ToSql> =
                 binds.iter().map(|b| b.as_ref()).collect();
-            let cards: Vec<Card> = stmt
+            let mut cards: Vec<Card> = stmt
                 .query_map(params_ref.as_slice(), row_to_card)?
                 .filter_map(|r| r.ok())
                 .collect();
+            load_links(conn, &mut cards);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&cards)?);
@@ -2468,6 +2610,7 @@ fn main() -> Result<()> {
                     sql.push_str(", 'new'");
                 }
                 sql.push_str(") AND (claimed_by = '' OR claimed_by IS NULL)");
+                sql.push_str(links::NOT_BLOCKED);
                 sql.push_str(&scope);
 
                 let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -2523,11 +2666,12 @@ fn main() -> Result<()> {
                 conn.execute_batch("COMMIT;")?;
                 refresh_views(&ctx, Some(id));
 
-                let card: Card = conn.query_row(
+                let mut card: Card = conn.query_row(
                     &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
                     params![id],
                     row_to_card,
                 )?;
+                load_links(conn, std::slice::from_mut(&mut card));
                 print_card(&card, json, multi);
             } else {
                 // Read-only next (no claim)
@@ -2539,6 +2683,7 @@ fn main() -> Result<()> {
                     sql.push_str(", 'new'");
                 }
                 sql.push(')');
+                sql.push_str(links::NOT_BLOCKED);
                 sql.push_str(&scope);
 
                 let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -2563,6 +2708,8 @@ fn main() -> Result<()> {
                     Some(mut c) => {
                         if json {
                             load_entries(conn, std::slice::from_mut(&mut c));
+                        } else {
+                            load_links(conn, std::slice::from_mut(&mut c));
                         }
                         print_card(&c, json, multi);
                     }
@@ -2576,6 +2723,28 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+
+        Commands::Link { id, blocks, child_of, related, by } => {
+            let mut triples: Vec<(i64, &str, i64)> = Vec::new();
+            triples.extend(blocks.iter().map(|o| (id, "blocks", *o)));
+            triples.extend(child_of.iter().map(|o| (id, "child_of", *o)));
+            triples.extend(related.iter().map(|o| (id, "related", *o)));
+            link_cmd(&ctx, &triples, true, by.as_deref().unwrap_or(""))?;
+        }
+
+        Commands::Block { id, on, by } => {
+            // `bl block X --on Y` reads the way a human says it: X waits on Y.
+            let triples: Vec<(i64, &str, i64)> = on.iter().map(|o| (*o, "blocks", id)).collect();
+            link_cmd(&ctx, &triples, true, by.as_deref().unwrap_or(""))?;
+        }
+
+        Commands::Unlink { id, blocks, child_of, related, by } => {
+            let mut triples: Vec<(i64, &str, i64)> = Vec::new();
+            triples.extend(blocks.iter().map(|o| (id, "blocks", *o)));
+            triples.extend(child_of.iter().map(|o| (id, "child_of", *o)));
+            triples.extend(related.iter().map(|o| (id, "related", *o)));
+            link_cmd(&ctx, &triples, false, by.as_deref().unwrap_or(""))?;
         }
 
         Commands::History { id, json } => {
@@ -2616,6 +2785,8 @@ fn main() -> Result<()> {
                     notes::reconcile(conn, id)?;
                     if json {
                         load_entries(conn, std::slice::from_mut(&mut c));
+                    } else {
+                        load_links(conn, std::slice::from_mut(&mut c));
                     }
                     print_card(&c, json, true);
                 }

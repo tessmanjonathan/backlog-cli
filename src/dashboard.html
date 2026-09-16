@@ -693,12 +693,16 @@
       ? `<span class="chip project">${esc(c.project)}</span>` : "";
     const outcomeChip = c.status === "done" && c.outcome
       ? `<span class="chip done">outcome</span>` : "";
+    const openBlockers = (c.links || []).filter((l) => l.rel === "blocked_by" && l.status !== "done");
+    const waitChip = openBlockers.length
+      ? `<span class="chip agent" title="${esc(openBlockers.map((l) => "#" + l.id + " " + l.title).join("\n"))}">waits on ${
+          openBlockers.map((l) => "#" + l.id).join(" ")}</span>` : "";
     return `
       <button class="card" data-id="${c.id}" style="--heat:${heat(c.priority)}"
               aria-current="${state.selected === c.id}">
         <div class="top">
           <span class="id">#${c.id}</span>
-          ${projectChip}${labelChip}
+          ${projectChip}${labelChip}${waitChip}
           <span class="pri">${c.priority}</span>
         </div>
         <div class="title">${esc(c.title)}</div>
@@ -772,6 +776,15 @@
           `<b>${esc(sha)}</b>${subject ? "  " + esc(subject) : ""}`).join("\n")
       }</pre></div>` : ""}
       ${c.outcome ? `<div class="block"><h3 class="label">Outcome</h3><pre>${esc(c.outcome)}</pre></div>` : ""}
+      ${(c.links && c.links.length) ? `<div class="block"><h3 class="label">Links</h3><pre>${
+        ["blocked_by", "blocks", "child_of", "parent_of", "related"].map((rel) => {
+          const items = c.links.filter((l) => l.rel === rel);
+          if (!items.length) return "";
+          const name = { blocked_by: "blocked by", blocks: "blocks", child_of: "child of", parent_of: "children", related: "related" }[rel];
+          return `<b>${name}</b>  ${items.map((l) =>
+            `<a href="#card-${l.id}" data-goto="${l.id}">#${l.id}</a> <span style="color:var(--ink-3)">${esc(l.status)}</span> ${esc(l.title)}`
+          ).join("\n" + " ".repeat(name.length + 2))}`;
+        }).filter(Boolean).join("\n")}</pre></div>` : ""}
       ${(c.events && c.events.length) ? `<div class="block"><h3 class="label">Timeline</h3><pre>${
         c.events.map((e) => {
           const flat = (s) => { const f = String(s).replace(/\n/g, " | "); return f.length > 120 ? f.slice(0, 117) + "..." : f; };
@@ -787,6 +800,8 @@
     rail.hidden = false;
     scrim.hidden = false;
     $("railclose").addEventListener("click", close);
+    rail.querySelectorAll("[data-goto]").forEach((a) =>
+      a.addEventListener("click", (e) => { e.preventDefault(); select(Number(a.dataset.goto)); }));
   }
 
   function select(id) {

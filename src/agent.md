@@ -85,6 +85,7 @@ long one — the next agent can filter them.
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl status <id> <new\|ready\|in_progress\|done> [--outcome "..."] [--by <id>]` | Move it |
 | `bl history <id> [--json]` | Every status, claim, priority and field change, with who and when |
+| `bl link <id> --blocks ID` · `--child-of ID` · `--related ID` · `bl block <id> --on ID` | Relate cards: `bl next` skips a card while something it waits on is not done |
 | `bl edit <id> [--title] [--label] [--add-tag T] [--rm-tag T] [--priority] [--outcome] [--status] [--move PROJECT]` | Change a card; `bl retitle <id> "..."` for the title alone |
 | `bl edit --ids 1,2,3 --priority 100` · `bl edit --where label=art --set priority=100 [--dry-run]` | Same change on many cards; `--dry-run` lists them first |
 | `bl set-priority <id> <0-10000>` | Re-rank |
@@ -109,6 +110,8 @@ are parsing rather than reading.
    Titles are refused over 120 characters and outcomes over 300: they are headlines, and
    the detail goes in notes.
 7. Discovered extra work? `bl create` a follow-up. Don't quietly widen the card you hold.
+   If it must land first, `bl block <yours> --on <new>`; if it is part of an epic,
+   `bl link <new> --child-of <epic>`. Fan-outs order themselves that way.
 8. Status flow: `new → ready → in_progress → done`.
 9. Never run `bl export` in a loop — the view pages keep themselves current.
 10. A wrong title, label or priority is fixed with `bl edit` / `bl retitle`; a card filed in
