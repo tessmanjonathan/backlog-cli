@@ -254,5 +254,21 @@ printf '[{"title":"dry"}]' | $BL import --stdin --dry-run 2>/dev/null | grep -q 
 $BL search dry --open >/dev/null 2>&1 && fail "dry run wrote"
 ok "import --stdin"
 
+# 21. guards: long titles and outcomes are refused with a hint, --force overrides
+cd "$T/alpha"
+long=$(printf 'x%.0s' $(seq 1 121)); longer=$(printf 'y%.0s' $(seq 1 301))
+$BL create "$long" 2>&1 | grep -q "title is 121 characters (limit 120).*note" || fail "long title accepted or wrong hint"
+gid=$($BL create "$long" --force | grep -o '#[0-9]*' | tr -d '#') || fail "--force did not create"
+if $BL retitle "$gid" "$long" 2>/dev/null; then fail "retitle long title accepted"; fi
+if $BL edit "$gid" --title "$long" 2>/dev/null; then fail "edit long title accepted"; fi
+$BL edit "$gid" --title "$long" --force >/dev/null || fail "edit --force"
+$BL status "$gid" done --outcome "$longer" 2>&1 | grep -q "outcome is 301 characters (limit 300).*note" || fail "long outcome accepted"
+$BL show "$gid" | grep -q "  in_progress\|  new " || fail "refused status still moved the card"
+$BL status "$gid" done --outcome "$longer" --force | grep -q "done" || fail "status --force"
+if $BL edit "$gid" --outcome "$longer" 2>/dev/null; then fail "edit long outcome accepted"; fi
+if printf '{"title":"%s"}' "$long" | $BL import --stdin >/dev/null 2>&1; then fail "stdin long title accepted"; fi
+$BL prompt | grep -q "over 120 characters" || fail "prompt does not state the limit"
+ok "title / outcome guards"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

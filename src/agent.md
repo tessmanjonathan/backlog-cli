@@ -103,6 +103,8 @@ are parsing rather than reading.
    `status`, `edit` and `set-priority` so the log says who.
 5. After committing code for a card: `bl note <id> "what changed" --commit` links the sha.
 6. Finish with `bl status <id> done --outcome "..."`. The outcome is what a human reads first.
+   Titles are refused over 120 characters and outcomes over 300: they are headlines, and
+   the detail goes in notes.
 7. Discovered extra work? `bl create` a follow-up. Don't quietly widen the card you hold.
 8. Status flow: `new → ready → in_progress → done`.
 9. Never run `bl export` in a loop — the view pages keep themselves current.

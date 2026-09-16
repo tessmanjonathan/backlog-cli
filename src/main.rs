@@ -211,6 +211,9 @@ enum Commands {
         /// Who is creating it, for the event log
         #[arg(long)]
         by: Option<String>,
+        /// Accept a title over 120 characters anyway
+        #[arg(long)]
+        force: bool,
     },
 
     /// Change any field of one card, or of many with --ids / --where
@@ -249,12 +252,21 @@ enum Commands {
         /// Who is editing, for the event log
         #[arg(long)]
         by: Option<String>,
+        /// Accept a title over 120 or an outcome over 300 characters anyway
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
 
     /// Change a card's title (short for `bl edit <id> --title`)
-    Retitle { id: i64, title: String },
+    Retitle {
+        id: i64,
+        title: String,
+        /// Accept a title over 120 characters anyway
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Remove a card created in error. Its title and notes stay in `bl history`.
     Delete {
@@ -289,6 +301,9 @@ enum Commands {
         /// Who is moving it, for the event log
         #[arg(long)]
         by: Option<String>,
+        /// Accept an outcome over 300 characters anyway
+        #[arg(long)]
+        force: bool,
     },
 
     /// Replay every change a card went through (works for deleted cards too)
@@ -1266,6 +1281,7 @@ struct EditFields {
     status: Option<Status>,
     move_to: Option<String>,
     by: String,
+    force: bool,
 }
 
 /// Apply every given field in one transaction. Returns the names of the
@@ -1433,9 +1449,7 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
     let mut changed: Vec<String> = Vec::new();
 
     if let Some(t) = &f.title {
-        if t.trim().is_empty() {
-            bail!("a title cannot be empty");
-        }
+        check_title(t, f.force)?;
         sets.push("title = ?".into());
         binds.push(Box::new(t.trim().to_string()));
         changed.push("title".into());
@@ -1454,6 +1468,7 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
         changed.push("priority".into());
     }
     if let Some(o) = &f.outcome {
+        check_outcome(o, f.force)?;
         sets.push("outcome = ?".into());
         binds.push(Box::new(o.clone()));
         changed.push("outcome".into());
@@ -1555,10 +1570,34 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
 
 // ---------------------------------------------------------------- guards
 
-/// A title must not be empty. (Length limits arrive with the guard card.)
-pub(crate) fn check_title(title: &str, _force: bool) -> Result<()> {
+/// Titles and outcomes are headlines; the detail belongs in notes. Boards
+/// where agents ignored that ended up with 500-character titles.
+pub(crate) const TITLE_MAX: usize = 120;
+pub(crate) const OUTCOME_MAX: usize = 300;
+
+pub(crate) fn check_title(title: &str, force: bool) -> Result<()> {
     if title.trim().is_empty() {
         bail!("a title cannot be empty");
+    }
+    let n = title.trim().chars().count();
+    if n > TITLE_MAX && !force {
+        bail!(
+            "title is {} characters (limit {}): keep the title to one line and put the detail in a note \
+             (`bl note <id> \"...\"`), or pass --force",
+            n, TITLE_MAX
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn check_outcome(outcome: &str, force: bool) -> Result<()> {
+    let n = outcome.chars().count();
+    if n > OUTCOME_MAX && !force {
+        bail!(
+            "outcome is {} characters (limit {}): say the result in a line and put the detail in a note \
+             (`bl note <id> \"...\" -k finding`), or pass --force",
+            n, OUTCOME_MAX
+        );
     }
     Ok(())
 }
@@ -1897,10 +1936,13 @@ fn main() -> Result<()> {
             notes: notes_text,
             if_absent,
             by,
+            force,
         } => {
             if !(0..=10000).contains(&priority) {
                 bail!("priority must be 0..=10000");
             }
+            check_title(&title, force)?;
+            let title = title.trim().to_string();
             let project = ctx.require_project()?;
             let now = now_str();
 
@@ -1949,6 +1991,7 @@ fn main() -> Result<()> {
             status,
             r#move,
             by,
+            force,
             json,
         } => {
             let mut fields = EditFields {
@@ -1960,6 +2003,7 @@ fn main() -> Result<()> {
                 status,
                 move_to: r#move,
                 by: by.unwrap_or_default(),
+                force,
             };
             for pair in &set {
                 parse_set(&mut fields, pair)?;
@@ -2030,12 +2074,13 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Retitle { id, title } => {
+        Commands::Retitle { id, title, force } => {
             edit_card(
                 &ctx,
                 id,
                 EditFields {
                     title: Some(title.clone()),
+                    force,
                     ..Default::default()
                 },
             )?;
@@ -2071,7 +2116,8 @@ fn main() -> Result<()> {
             refresh_views(&ctx, Some(id));
         }
 
-        Commands::Status { id, status, outcome, by } => {
+        Commands::Status { id, status, outcome, by, force } => {
+            check_outcome(&outcome, force)?;
             let now = now_str();
             let who = by.unwrap_or_default();
             // Clear claim when leaving in_progress (or explicitly setting ready/new/done)
