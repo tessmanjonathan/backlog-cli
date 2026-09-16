@@ -94,7 +94,8 @@ bl decay --amount 25   # run daily / on schedule
 | `bl show <id> [--json]` | One card |
 | `bl search <words...> [-l label] [--open] [-n 30] [--json]` | Find cards by any word in them |
 | `bl note <id> "text" [-k kind] [--by who] [--commit [REV]] [--unique]` | Add a note |
-| `bl notes <id> [-k kind] [--json]` | Read a card's notes |
+| `bl notes <id> [-k kind] [--json]` | Read a card's notes, each with its note id |
+| `bl note edit <note-id> ["text"] [-k kind]` · `bl note rm <note-id>` | Fix or remove one note by id; the card's notes mirror and the event log follow |
 | `bl heartbeat <id> --by <agent-id>` | Keep a long claim alive |
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl decay [-a 25]` | Subtract priority from all non-done cards |

@@ -75,7 +75,8 @@ long one — the next agent can filter them.
 | `bl create "title" [--label X] [--priority 0-10000] [--notes "..."] [--if-absent]` | New card (status `new`) |
 | `bl search <words...> [--label X] [--open] [--json]` | Find cards by any word in them |
 | `bl note <id> "text" [--kind K] [--by <id>] [--commit [REV]] [--unique]` | Add a note |
-| `bl notes <id> [--kind K] [--json]` | Read a card's notes |
+| `bl notes <id> [--kind K] [--json]` | Read a card's notes (each line ends with its note id) |
+| `bl note edit <note-id> "text" [--kind K]` · `bl note rm <note-id>` | Fix or drop one note you got wrong |
 | `bl heartbeat <id> --by <agent-id>` | Keep a long claim alive |
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl status <id> <new\|ready\|in_progress\|done> [--outcome "..."] [--by <id>]` | Move it |

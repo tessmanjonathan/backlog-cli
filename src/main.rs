@@ -342,10 +342,15 @@ enum Commands {
         json: bool,
     },
 
-    /// Append a note to a card, optionally typed and linked to a git commit
+    /// Append a note to a card; `bl note edit|rm <note-id>` fixes one by its id
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Note {
-        id: i64,
-        text: String,
+        #[command(subcommand)]
+        action: Option<NoteAction>,
+        #[arg(required = true)]
+        id: Option<i64>,
+        #[arg(required = true)]
+        text: Option<String>,
         /// What kind of note: note, finding, decision, blocker, attempt, …
         #[arg(short, long, default_value = "note")]
         kind: String,
@@ -510,6 +515,27 @@ enum ProjectAction {
         /// Delete the project and every card and note under it
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NoteAction {
+    /// Rewrite one note's text and/or kind (`bl notes <card>` prints the ids)
+    Edit {
+        note_id: i64,
+        text: Option<String>,
+        #[arg(short, long)]
+        kind: Option<String>,
+        /// Who is editing, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Remove one note by its id
+    Rm {
+        note_id: i64,
+        /// Who is removing it, for the event log
+        #[arg(long)]
+        by: Option<String>,
     },
 }
 
@@ -2414,6 +2440,48 @@ fn main() -> Result<()> {
         }
 
         Commands::Note {
+            action: Some(NoteAction::Edit { note_id, text, kind, by }),
+            ..
+        } => {
+            if text.is_none() && kind.is_none() {
+                bail!("nothing to change: give new text and/or --kind");
+            }
+            let now = now_str();
+            let (card_id, old) = transaction(conn, || {
+                let (card_id, old) = notes::edit(conn, note_id, text.as_deref(), kind.as_deref(), &now)?;
+                let who = by.as_deref().unwrap_or("");
+                if let Some(t) = &text {
+                    if *t != old.body {
+                        events::record(conn, card_id, None, "note_edit", &old.body, t, who, &now)?;
+                    }
+                }
+                if let Some(k) = &kind {
+                    if *k != old.kind {
+                        events::record(conn, card_id, None, "note_kind", &old.kind, k, who, &now)?;
+                    }
+                }
+                Ok((card_id, old))
+            })?;
+            println!("note {} on #{} edited (was: {})", note_id, card_id, old.render().replace('\n', " | "));
+            refresh_views(&ctx, Some(card_id));
+        }
+
+        Commands::Note {
+            action: Some(NoteAction::Rm { note_id, by }),
+            ..
+        } => {
+            let now = now_str();
+            let (card_id, old) = transaction(conn, || {
+                let (card_id, old) = notes::remove(conn, note_id, &now)?;
+                events::record(conn, card_id, None, "note_rm", &old.render(), "", by.as_deref().unwrap_or(""), &now)?;
+                Ok((card_id, old))
+            })?;
+            println!("note {} removed from #{}: {}", note_id, card_id, old.render().replace('\n', " | "));
+            refresh_views(&ctx, Some(card_id));
+        }
+
+        Commands::Note {
+            action: None,
             id,
             text,
             kind,
@@ -2421,6 +2489,10 @@ fn main() -> Result<()> {
             commit,
             unique,
         } => {
+            let (id, text) = match (id, text) {
+                (Some(i), Some(t)) => (i, t),
+                _ => bail!("usage: bl note <card-id> \"text\" (or bl note edit|rm <note-id>)"),
+            };
             let now = now_str();
             let old_commits: String = conn
                 .query_row("SELECT commits FROM cards WHERE id = ?", params![id], |r| {
@@ -2499,7 +2571,7 @@ fn main() -> Result<()> {
                     } else {
                         format!("  {}", n.author)
                     };
-                    println!("[{}] {}{}", n.kind, n.created_at, who);
+                    println!("[{}] {}{}  (note {})", n.kind, n.created_at, who, n.id);
                     println!("    {}", n.body.replace('\n', "\n    "));
                     if !n.commit_sha.is_empty() {
                         println!("    commit: {} {}", n.commit_sha, n.commit_subject);

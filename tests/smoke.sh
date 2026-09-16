@@ -216,5 +216,23 @@ $BL history "$b1" | grep -q "label .*art → visual" || fail "bulk edit event mi
 if $BL edit --set priority=1 2>/dev/null; then fail "edit with no target should refuse"; fi
 ok "bulk edit"
 
+# 19. note edit / rm by note id: mirror rebuilt, events written, plain bl note still works
+cd "$T/alpha"
+nc=$($BL create "note surgery" | grep -o '#[0-9]*' | tr -d '#')
+$BL note "$nc" "first" >/dev/null; $BL note "$nc" "secnod, with typo" -k finding >/dev/null; $BL note "$nc" "third" >/dev/null
+n2=$($BL notes "$nc" | grep -B1 "secnod" | grep -o '(note [0-9]*)' | grep -o '[0-9]*')
+[ -n "$n2" ] || fail "bl notes prints no note id: $($BL notes "$nc")"
+$BL note edit "$n2" "second, fixed" -k decision --by fixer | grep -q "note $n2 on #$nc edited" || fail "note edit"
+$BL notes "$nc" | grep -q "^\[decision\].*(note $n2)" || fail "kind not changed"
+$BL show "$nc" | grep -q "first | \[decision\] second, fixed | third" || fail "mirror not rebuilt after edit: $($BL show "$nc" | grep notes:)"
+$BL note rm "$n2" --by fixer | grep -q "removed from #$nc" || fail "note rm"
+$BL show "$nc" | grep -q "notes: first | third$" || fail "mirror not rebuilt after rm: $($BL show "$nc" | grep notes:)"
+[ "$($BL notes "$nc" | grep -c '^\[')" = 2 ] || fail "note count after rm"
+$BL history "$nc" | grep -q "note_edit .*secnod, with typo → second, fixed  by fixer" || fail "note_edit event"
+$BL history "$nc" | grep -q "note_rm .*second, fixed →  by fixer" || fail "note_rm event: $($BL history "$nc")"
+if $BL note rm 999999 2>/dev/null; then fail "rm of a missing note should fail"; fi
+if $BL note "$nc" 2>/dev/null; then fail "bl note with no text should fail"; fi
+ok "note edit / rm"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

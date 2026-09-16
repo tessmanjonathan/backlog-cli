@@ -166,6 +166,59 @@ pub(crate) fn add(
     Ok(Some(id))
 }
 
+/// Rewrite one note in place. Returns the card it belongs to and the old
+/// note, for the event row.
+pub(crate) fn edit(
+    conn: &Connection,
+    note_id: i64,
+    body: Option<&str>,
+    kind: Option<&str>,
+    now: &str,
+) -> Result<(i64, Note)> {
+    let (card_id, old) = get(conn, note_id)?;
+    reconcile(conn, card_id)?;
+    conn.execute(
+        "UPDATE notes SET body = ?1, kind = ?2 WHERE id = ?3",
+        params![body.unwrap_or(&old.body), kind.unwrap_or(&old.kind), note_id],
+    )?;
+    rebuild_blob(conn, card_id, now)?;
+    Ok((card_id, old))
+}
+
+/// Delete one note and re-render the blob without it.
+pub(crate) fn remove(conn: &Connection, note_id: i64, now: &str) -> Result<(i64, Note)> {
+    let (card_id, old) = get(conn, note_id)?;
+    reconcile(conn, card_id)?;
+    conn.execute("DELETE FROM notes WHERE id = ?", params![note_id])?;
+    rebuild_blob(conn, card_id, now)?;
+    Ok((card_id, old))
+}
+
+/// One note by its own id, with the card it hangs on.
+pub(crate) fn get(conn: &Connection, note_id: i64) -> Result<(i64, Note)> {
+    conn.query_row(
+        "SELECT card_id, id, kind, author, body, commit_sha, commit_subject, created_at
+         FROM notes WHERE id = ?",
+        params![note_id],
+        |r| {
+            Ok((
+                r.get(0)?,
+                Note {
+                    id: r.get(1)?,
+                    kind: r.get(2)?,
+                    author: r.get(3)?,
+                    body: r.get(4)?,
+                    commit_sha: r.get(5)?,
+                    commit_subject: r.get(6)?,
+                    created_at: r.get(7)?,
+                },
+            ))
+        },
+    )
+    .optional()?
+    .ok_or_else(|| anyhow::anyhow!("note {} not found (`bl notes <card>` prints note ids)", note_id))
+}
+
 /// Rewrite `cards.notes` from the rows, so both views of the notes agree.
 pub(crate) fn rebuild_blob(conn: &Connection, card_id: i64, now: &str) -> Result<()> {
     let blob = list(conn, card_id)?
