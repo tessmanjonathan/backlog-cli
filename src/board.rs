@@ -8,10 +8,11 @@ use anyhow::Result;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-const COLUMNS: [(&str, &str); 4] = [
+const COLUMNS: [(&str, &str); 5] = [
     ("new", "NEW"),
     ("ready", "READY"),
     ("in_progress", "IN PROGRESS"),
+    ("blocked", "BLOCKED"),
     ("done", "DONE"),
 ];
 
@@ -98,6 +99,7 @@ fn status_color(status: &str) -> (u8, u8, u8) {
         "new" => (147, 164, 181),
         "ready" => (79, 191, 169),
         "in_progress" => (220, 165, 63),
+        "blocked" => (200, 96, 96),
         _ => (108, 123, 116),
     }
 }
@@ -327,13 +329,20 @@ fn panels(cards: &[&Card], p: &Paint, w: usize) -> String {
 }
 
 fn board(cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> String {
+    // The blocked column only takes room when something is parked there.
+    let any_blocked = cards.iter().any(|c| c.status == "blocked");
+    let shown: Vec<(&str, &str)> = COLUMNS
+        .iter()
+        .copied()
+        .filter(|(k, _)| *k != "blocked" || any_blocked)
+        .collect();
     let gutter = 2usize;
-    let col_w = (w.saturating_sub(gutter * 3)) / 4;
+    let col_w = (w.saturating_sub(gutter * (shown.len() - 1))) / shown.len();
     let col_w = col_w.max(16);
 
     // Build each column's lines, then print them side by side.
     let mut columns: Vec<Vec<String>> = Vec::new();
-    for (key, name) in COLUMNS {
+    for (key, name) in shown {
         let mut items: Vec<&&Card> = cards.iter().filter(|c| c.status == key).collect();
         let total = items.len();
         if key == "done" {

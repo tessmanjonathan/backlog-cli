@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS cards (
     notes       TEXT NOT NULL DEFAULT '',
     label       TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT 'new'
-                CHECK(status IN ('new', 'ready', 'in_progress', 'done')),
+                CHECK(status IN ('new', 'ready', 'in_progress', 'blocked', 'done')),
     priority    INTEGER NOT NULL DEFAULT 5000
                 CHECK(priority BETWEEN 0 AND 10000),
     outcome     TEXT NOT NULL DEFAULT '',
@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS cards (
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
     project_id  INTEGER NOT NULL DEFAULT 0,
-    legacy_id   INTEGER
+    legacy_id   INTEGER,
+    blocked_on  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_status_priority
@@ -129,6 +130,8 @@ enum Status {
     Ready,
     #[value(name = "in_progress")]
     InProgress,
+    /// Parked on someone or something: skipped by next and reap until moved on
+    Blocked,
     Done,
 }
 
@@ -138,8 +141,14 @@ impl Status {
             Status::New => "new",
             Status::Ready => "ready",
             Status::InProgress => "in_progress",
+            Status::Blocked => "blocked",
             Status::Done => "done",
         }
+    }
+
+    /// Everything but in_progress drops the claim.
+    fn clears_claim(&self) -> bool {
+        !matches!(self, Status::InProgress)
     }
 }
 
@@ -328,6 +337,9 @@ enum Commands {
         /// Accept an outcome over 300 characters anyway
         #[arg(long)]
         force: bool,
+        /// With `blocked`: who or what it waits on (a name, or #<card> to also link it)
+        #[arg(long, value_name = "WHO|#ID")]
+        on: Option<String>,
     },
 
     /// Relate two cards: `bl link 12 --blocks 14`, `--child-of 3`, `--related 9`
@@ -820,7 +832,10 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
         conn.execute_batch("ALTER TABLE cards ADD COLUMN commits TEXT NOT NULL DEFAULT '';")?;
     }
 
-    // Detect old CHECK constraint (no in_progress) via sqlite_master, then rebuild table.
+    // The status CHECK constraint has grown twice (in_progress, then
+    // blocked); SQLite cannot alter a CHECK, so a table from before either
+    // is rebuilt once. Foreign keys go off first: with them on, DROP TABLE
+    // cards would cascade-delete every note.
     let table_sql: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='cards'",
@@ -828,46 +843,13 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
             |r| r.get(0),
         )
         .unwrap_or_default();
-    let needs_status_migrate =
-        !table_sql.is_empty() && !table_sql.contains("in_progress");
+    if !table_sql.is_empty() && (!table_sql.contains("in_progress") || !table_sql.contains("'blocked'")) {
+        rebuild_cards_table(conn)?;
+    }
 
-    if needs_status_migrate {
-        conn.execute_batch(
-            r#"
-            BEGIN;
-            CREATE TABLE cards_new (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                title       TEXT NOT NULL,
-                notes       TEXT NOT NULL DEFAULT '',
-                label       TEXT NOT NULL DEFAULT '',
-                status      TEXT NOT NULL DEFAULT 'new'
-                            CHECK(status IN ('new', 'ready', 'in_progress', 'done')),
-                priority    INTEGER NOT NULL DEFAULT 5000
-                            CHECK(priority BETWEEN 0 AND 10000),
-                outcome     TEXT NOT NULL DEFAULT '',
-                claimed_by  TEXT NOT NULL DEFAULT '',
-                claimed_at  TEXT NOT NULL DEFAULT '',
-                commits     TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                project_id  INTEGER NOT NULL DEFAULT 0,
-                legacy_id   INTEGER
-            );
-            INSERT INTO cards_new (id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, legacy_id)
-            SELECT id, title, notes, label, status, priority, outcome,
-                   COALESCE(claimed_by, ''), COALESCE(claimed_at, ''),
-                   COALESCE(commits, ''),
-                   created_at, updated_at, COALESCE(project_id, 0), legacy_id
-            FROM cards;
-            DROP TABLE cards;
-            ALTER TABLE cards_new RENAME TO cards;
-            CREATE INDEX IF NOT EXISTS idx_status_priority ON cards(status, priority DESC, created_at ASC);
-            CREATE INDEX IF NOT EXISTS idx_label ON cards(label);
-            CREATE INDEX IF NOT EXISTS idx_claimed_by ON cards(claimed_by);
-            CREATE INDEX IF NOT EXISTS idx_project ON cards(project_id, status);
-            COMMIT;
-            "#,
-        )?;
+    // Why a card is parked, for the blocked status.
+    if !column_exists(conn, "cards", "blocked_on")? {
+        conn.execute_batch("ALTER TABLE cards ADD COLUMN blocked_on TEXT NOT NULL DEFAULT '';")?;
     }
 
     // Labels became tag lists: `art enemies c676 build` is four tags, stored
@@ -924,6 +906,65 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recreate `cards` with the current CHECK constraints, keeping every row
+/// and id. Runs with foreign keys off inside one transaction, the way the
+/// SQLite documentation prescribes, then checks nothing dangles.
+fn rebuild_cards_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let has_blocked_on = column_exists(conn, "cards", "blocked_on")?;
+    let result = conn.execute_batch(&format!(
+        r#"
+        BEGIN IMMEDIATE;
+        CREATE TABLE cards_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT NOT NULL,
+            notes       TEXT NOT NULL DEFAULT '',
+            label       TEXT NOT NULL DEFAULT '',
+            status      TEXT NOT NULL DEFAULT 'new'
+                        CHECK(status IN ('new', 'ready', 'in_progress', 'blocked', 'done')),
+            priority    INTEGER NOT NULL DEFAULT 5000
+                        CHECK(priority BETWEEN 0 AND 10000),
+            outcome     TEXT NOT NULL DEFAULT '',
+            claimed_by  TEXT NOT NULL DEFAULT '',
+            claimed_at  TEXT NOT NULL DEFAULT '',
+            commits     TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            project_id  INTEGER NOT NULL DEFAULT 0,
+            legacy_id   INTEGER,
+            blocked_on  TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO cards_new (id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, legacy_id, blocked_on)
+        SELECT id, title, notes, label, status, priority, outcome,
+               COALESCE(claimed_by, ''), COALESCE(claimed_at, ''),
+               COALESCE(commits, ''),
+               created_at, updated_at, COALESCE(project_id, 0), legacy_id, {blocked_on}
+        FROM cards;
+        DROP TABLE cards;
+        ALTER TABLE cards_new RENAME TO cards;
+        CREATE INDEX IF NOT EXISTS idx_status_priority ON cards(status, priority DESC, created_at ASC);
+        CREATE INDEX IF NOT EXISTS idx_label ON cards(label);
+        CREATE INDEX IF NOT EXISTS idx_claimed_by ON cards(claimed_by);
+        CREATE INDEX IF NOT EXISTS idx_project ON cards(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_legacy ON cards(project_id, legacy_id);
+        COMMIT;
+        "#,
+        blocked_on = if has_blocked_on { "COALESCE(blocked_on, '')" } else { "''" }
+    ));
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    result?;
+    let bad: Option<i64> = conn
+        .query_row("PRAGMA foreign_key_check", [], |r| r.get::<_, i64>(2))
+        .optional()?;
+    if let Some(row) = bad {
+        bail!("cards rebuild left a dangling note (rowid {})", row);
+    }
+    Ok(())
+}
+
 /// The project a card belongs to, for refreshing the right snapshot.
 fn card_project(conn: &Connection, id: i64) -> Option<i64> {
     conn.query_row(
@@ -956,6 +997,9 @@ pub(crate) struct Card {
     /// The id this card had in the repo-level database it was imported from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) legacy_id: Option<i64>,
+    /// Who or what a blocked card waits on.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) blocked_on: String,
     /// The notes as rows. Empty unless the caller asked for them, and always
     /// empty for a database old enough to lack the table.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -985,6 +1029,7 @@ pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         project_id: row.get::<_, i64>(12).unwrap_or(0),
         project: row.get::<_, String>(13).unwrap_or_default(),
         legacy_id: row.get::<_, Option<i64>>(14).unwrap_or(None),
+        blocked_on: row.get::<_, Option<String>>(15).ok().flatten().unwrap_or_default(),
         entries: Vec::new(),
         events: Vec::new(),
         links: Vec::new(),
@@ -1023,7 +1068,7 @@ pub(crate) const CARD_COLS: &str =
     "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id";
 
 /// Columns that come after the project name in `row_to_card` order.
-pub(crate) const TRAILING_COLS: &str = "legacy_id";
+pub(crate) const TRAILING_COLS: &str = "legacy_id, blocked_on";
 
 /// The project's name, looked up per row. No comma-space inside, so
 /// `read_cards` can still split the list on `", "`.
@@ -1031,7 +1076,7 @@ pub(crate) const PROJECT_COL: &str =
     "IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project";
 
 pub(crate) const SELECT_COLS: &str =
-    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project, legacy_id";
+    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project, legacy_id, blocked_on";
 
 /// Print a card. `show_project` puts the project name on the first line, for
 /// listings that span more than one.
@@ -1070,6 +1115,9 @@ fn print_card(c: &Card, json: bool, show_project: bool) {
         }
         if !c.claimed_at.is_empty() {
             println!("    claimed_at: {}", c.claimed_at);
+        }
+        if !c.blocked_on.is_empty() {
+            println!("    blocked on: {}", c.blocked_on);
         }
         if let Some(old) = c.legacy_id {
             println!("    imported: was #{} in {}'s own backlog.db", old, c.project);
@@ -1425,12 +1473,13 @@ struct Snapshot {
     claimed_by: String,
     project_id: i64,
     notes: String,
+    blocked_on: String,
 }
 
 fn snapshot(conn: &Connection, id: i64) -> Result<Option<Snapshot>> {
     Ok(conn
         .query_row(
-            "SELECT title, label, priority, outcome, status, claimed_by, project_id, notes
+            "SELECT title, label, priority, outcome, status, claimed_by, project_id, notes, blocked_on
              FROM cards WHERE id = ?",
             params![id],
             |r| {
@@ -1443,6 +1492,7 @@ fn snapshot(conn: &Connection, id: i64) -> Result<Option<Snapshot>> {
                     claimed_by: r.get(5)?,
                     project_id: r.get(6)?,
                     notes: r.get(7)?,
+                    blocked_on: r.get(8)?,
                 })
             },
         )
@@ -1488,7 +1538,7 @@ fn parse_set(f: &mut EditFields, pair: &str) -> Result<()> {
         "status" => {
             f.status = Some(
                 <Status as ValueEnum>::from_str(v.trim(), true)
-                    .map_err(|_| anyhow::anyhow!("status '{}' is not one of new, ready, in_progress, done", v))?,
+                    .map_err(|_| anyhow::anyhow!("status '{}' is not one of new, ready, in_progress, blocked, done", v))?,
             )
         }
         "project" | "move" => f.move_to = Some(v),
@@ -1628,10 +1678,14 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
     if let Some(st) = &f.status {
         sets.push("status = ?".into());
         binds.push(Box::new(st.as_str().to_string()));
-        // The same rule as `bl status`: leaving in_progress drops the claim.
-        if matches!(st, Status::New | Status::Ready | Status::Done) {
+        // The same rule as `bl status`: leaving in_progress drops the claim,
+        // and leaving blocked drops the reason.
+        if st.clears_claim() {
             sets.push("claimed_by = ''".into());
             sets.push("claimed_at = ''".into());
+        }
+        if !matches!(st, Status::Blocked) {
+            sets.push("blocked_on = ''".into());
         }
         changed.push("status".into());
     }
@@ -1702,8 +1756,11 @@ fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(
         }
         if let Some(st) = &f.status {
             ev("status", &old.status, st.as_str())?;
-            if !old.claimed_by.is_empty() && matches!(st, Status::New | Status::Ready | Status::Done) {
+            if !old.claimed_by.is_empty() && st.clears_claim() {
                 ev("release", &old.claimed_by, "")?;
+            }
+            if !matches!(st, Status::Blocked) && !old.blocked_on.is_empty() {
+                ev("blocked_on", &old.blocked_on, "")?;
             }
         }
         if let Some(p) = &moved {
@@ -1860,6 +1917,9 @@ fn delete_card(conn: &Connection, id: i64, why: &str, force: bool, by: &str, now
     }
     if !old.outcome.is_empty() {
         payload.push_str(&format!("\noutcome: {}", old.outcome));
+    }
+    if !old.blocked_on.is_empty() {
+        payload.push_str(&format!("\nblocked on: {}", old.blocked_on));
     }
     for n in notes::list(conn, id)? {
         payload.push_str(&format!(
@@ -2357,40 +2417,32 @@ fn main() -> Result<()> {
             refresh_views(&ctx, Some(id));
         }
 
-        Commands::Status { id, status, outcome, by, force } => {
+        Commands::Status { id, status, outcome, by, force, on } => {
             check_outcome(&outcome, force)?;
             let now = now_str();
             let who = by.unwrap_or_default();
-            // Clear claim when leaving in_progress (or explicitly setting ready/new/done)
-            let clear_claim = matches!(status, Status::New | Status::Ready | Status::Done);
+            let reason = match (&status, &on) {
+                (Status::Blocked, Some(r)) if !r.trim().is_empty() => r.trim().to_string(),
+                (Status::Blocked, _) => bail!("blocked on what? `--on <who>` or `--on #<card>`"),
+                (_, Some(_)) => bail!("--on goes with `blocked`"),
+                _ => String::new(),
+            };
+            // Any status but in_progress drops the claim; leaving blocked drops the reason.
+            let clear_claim = status.clears_claim();
             transaction(conn, || {
                 let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
-                let n = if outcome.is_empty() {
-                    if clear_claim {
-                        conn.execute(
-                            "UPDATE cards SET status = ?1, claimed_by = '', claimed_at = '', updated_at = ?2 WHERE id = ?3",
-                            params![status.as_str(), now, id],
-                        )?
-                    } else {
-                        conn.execute(
-                            "UPDATE cards SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                            params![status.as_str(), now, id],
-                        )?
-                    }
-                } else if clear_claim {
-                    conn.execute(
-                        "UPDATE cards SET status = ?1, outcome = ?2, claimed_by = '', claimed_at = '', updated_at = ?3 WHERE id = ?4",
-                        params![status.as_str(), outcome, now, id],
-                    )?
-                } else {
-                    conn.execute(
-                        "UPDATE cards SET status = ?1, outcome = ?2, updated_at = ?3 WHERE id = ?4",
-                        params![status.as_str(), outcome, now, id],
-                    )?
-                };
-                if n == 0 {
-                    bail!("card #{} not found", id);
+                let mut sets = vec!["status = ?1", "updated_at = ?2", "blocked_on = ?3"];
+                if !outcome.is_empty() {
+                    sets.push("outcome = ?4");
                 }
+                if clear_claim {
+                    sets.push("claimed_by = ''");
+                    sets.push("claimed_at = ''");
+                }
+                conn.execute(
+                    &format!("UPDATE cards SET {} WHERE id = ?5", sets.join(", ")),
+                    params![status.as_str(), now, reason, outcome, id],
+                )?;
                 if old.status != status.as_str() {
                     events::record(conn, id, Some(old.project_id), "status", &old.status, status.as_str(), &who, &now)?;
                 }
@@ -2399,6 +2451,18 @@ fn main() -> Result<()> {
                 }
                 if !outcome.is_empty() && old.outcome != outcome {
                     events::record(conn, id, Some(old.project_id), "outcome", &old.outcome, &outcome, &who, &now)?;
+                }
+                if old.blocked_on != reason {
+                    events::record(conn, id, Some(old.project_id), "blocked_on", &old.blocked_on, &reason, &who, &now)?;
+                }
+                // `--on #12` is also a dependency: #12 blocks this card.
+                if let Some(other) = reason.strip_prefix('#').and_then(|n| n.parse::<i64>().ok()) {
+                    if other != id && links::add(conn, other, "blocks", id, &who, &now).unwrap_or(false) {
+                        let what = format!("#{} blocks #{}", other, id);
+                        for card in [other, id] {
+                            events::record(conn, card, None, "link", "", &what, &who, &now)?;
+                        }
+                    }
                 }
                 Ok(())
             })?;

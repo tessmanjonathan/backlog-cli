@@ -88,7 +88,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl retitle <id> "title"` | Short for `bl edit --title` |
 | `bl delete <id> [--why "..."] [--force] [--by who]` | Remove a card; title and notes stay in `bl history <id>` (claimed cards need `--force`) |
 | `bl set-priority <id> <0-10000>` | Set priority score |
-| `bl status <id> <new\|ready\|done> [--outcome "..."] [--by who]` | Move status; an outcome over 300 characters is refused unless `--force` (put the detail in a note) |
+| `bl status <id> <new\|ready\|in_progress\|blocked\|done> [--outcome "..."] [--on WHO\|#ID] [--by who]` | Move status; `blocked --on <who or #card>` parks a card (skipped by `next` and `reap`, shown with its reason; `--on #12` also links #12 as a blocker); an outcome over 300 characters is refused unless `--force` |
 | `bl history <id> [--json]` | Every change the card went through: status, claim, priority, title, ... (works after delete) |
 | `bl link <id> [--blocks ID] [--child-of ID] [--related ID]` · `bl unlink` (same flags) · `bl block <id> --on ID` | Relate cards; a card with an open blocker is skipped by `bl next` and says `blocked by` wherever it is printed |
 | `bl list [-l tag[,tag]] [-s new,ready] [-n 30] [--json]` | List ordered by priority; `-l` matches a card carrying any of the tags |

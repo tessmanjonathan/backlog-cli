@@ -30,6 +30,8 @@
     --s-prog-bg:  #F3E6CB;
     --s-done:     #7C8A83;
     --s-done-bg:  #E6EBE8;
+    --s-block:    #A6403A;
+    --s-block-bg: #F1DEDC;
 
     /* Priority heat ramp */
     --heat-cold: #7C93A0;
@@ -62,6 +64,8 @@
       --s-prog-bg:  #322610;
       --s-done:     #6C7B74;
       --s-done-bg:  #1B2320;
+      --s-block:    #D9736C;
+      --s-block-bg: #2E1F1E;
 
       --heat-cold: #61818F;
       --heat-hot:  #E06A4E;
@@ -89,6 +93,8 @@
     --s-prog-bg:  #322610;
     --s-done:     #6C7B74;
     --s-done-bg:  #1B2320;
+    --s-block:    #D9736C;
+    --s-block-bg: #2E1F1E;
 
     --heat-cold: #61818F;
     --heat-hot:  #E06A4E;
@@ -286,7 +292,7 @@
 
   .board {
     display: grid;
-    grid-template-columns: repeat(4, minmax(215px, 1fr));
+    grid-template-columns: repeat(var(--cols, 4), minmax(215px, 1fr));
     gap: 14px;
     align-items: start;
   }
@@ -532,6 +538,7 @@
     { key: "new",         name: "New",         color: "var(--s-new)" },
     { key: "ready",       name: "Ready",       color: "var(--s-ready)" },
     { key: "in_progress", name: "In progress", color: "var(--s-prog)" },
+    { key: "blocked",     name: "Blocked",     color: "var(--s-block)", optional: true },
     { key: "done",        name: "Done",        color: "var(--s-done)" },
   ];
 
@@ -617,7 +624,8 @@
     }, Date.now());
 
     const tiles = [
-      ["Open", open.length, `${cards.filter((c) => c.status === "new").length} new · ${cards.filter((c) => c.status === "ready").length} ready`],
+      ["Open", open.length, `${cards.filter((c) => c.status === "new").length} new · ${cards.filter((c) => c.status === "ready").length} ready${
+        cards.some((c) => c.status === "blocked") ? ` · ${cards.filter((c) => c.status === "blocked").length} blocked` : ""}`],
       ["In progress", prog.length, agents.size ? `${agents.size} agent${agents.size > 1 ? "s" : ""} holding` : "unclaimed"],
       ["Avg priority", avg, open.length ? "across open cards" : "nothing open"],
       ["Top card", top ? "#" + top.id : "—", top ? `priority ${top.priority}` : "board clear"],
@@ -693,6 +701,8 @@
       ? `<span class="chip project">${esc(c.project)}</span>` : "";
     const outcomeChip = c.status === "done" && c.outcome
       ? `<span class="chip done">outcome</span>` : "";
+    const blockedChip = c.status === "blocked" && c.blocked_on
+      ? `<span class="chip agent">on ${esc(c.blocked_on)}</span>` : "";
     const openBlockers = (c.links || []).filter((l) => l.rel === "blocked_by" && l.status !== "done");
     const waitChip = openBlockers.length
       ? `<span class="chip agent" title="${esc(openBlockers.map((l) => "#" + l.id + " " + l.title).join("\n"))}">waits on ${
@@ -707,14 +717,17 @@
         </div>
         <div class="title">${esc(c.title)}</div>
         <div class="meta">
-          ${agentChip}${outcomeChip}
+          ${agentChip}${blockedChip}${outcomeChip}
           <span class="ago">${esc(ago(c.updated_at))}</span>
         </div>
       </button>`;
   }
 
   function renderBoard(cards) {
-    $("board").innerHTML = COLUMNS.map((col) => {
+    // The blocked column appears only while something is parked there.
+    const cols = COLUMNS.filter((col) => !col.optional || cards.some((c) => c.status === col.key));
+    $("board").style.setProperty("--cols", cols.length);
+    $("board").innerHTML = cols.map((col) => {
       let items = cards.filter((c) => c.status === col.key);
       const total = items.length;
       if (col.key === "done") {
@@ -746,7 +759,7 @@
       scrim.hidden = true;
       return;
     }
-    const statusColor = { new: "--s-new", ready: "--s-ready", in_progress: "--s-prog", done: "--s-done" }[c.status];
+    const statusColor = { new: "--s-new", ready: "--s-ready", in_progress: "--s-prog", blocked: "--s-block", done: "--s-done" }[c.status] || "--s-new";
     rail.innerHTML = `
       <button class="close" id="railclose" aria-label="Close">✕</button>
       <div>
@@ -755,7 +768,7 @@
       </div>
       <dl class="kv">
         ${c.project ? `<dt>Project</dt><dd>${esc(c.project)}</dd>` : ""}
-        <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}</dd>
+        <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}${c.blocked_on ? ` <span style="color:var(--ink-3)">on ${esc(c.blocked_on)}</span>` : ""}</dd>
         <dt>Priority</dt><dd style="color:${heat(c.priority)}">${c.priority}</dd>
         <dt>Tags</dt><dd>${esc(tagsOf(c.label).join(", ") || "—")}</dd>
         <dt>Claimed</dt><dd>${c.claimed_by ? esc("@" + c.claimed_by) + " · " + esc(full(c.claimed_at)) : "—"}</dd>

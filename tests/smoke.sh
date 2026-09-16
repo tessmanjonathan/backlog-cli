@@ -331,5 +331,53 @@ $BL show "$l2" | grep -q "related:" && fail "related survived unlink"
 $BL delete "$l1" --why test >/dev/null; $BL show "$l2" | grep -q "blocked by" && fail "link survived delete of the blocker"
 ok "links / block"
 
+# 25. blocked status: --on required, skipped by next/reap, reason shown, ready clears it; 0.4 db rebuilt with its notes intact
+cd "$T/alpha"
+bk=$($BL create "needs jonathan" -p 9950 | grep -o '#[0-9]*' | tr -d '#')
+$BL next | grep -q "needs jonathan" || fail "precondition: blocked candidate is top"
+if $BL status "$bk" blocked 2>/dev/null; then fail "blocked without --on accepted"; fi
+$BL claim "$bk" --by parker >/dev/null
+$BL status "$bk" blocked --on jonathan --by parker | grep -q "blocked" || fail "status blocked"
+$BL next | grep -q "needs jonathan" && fail "next picked a blocked card"
+$BL list | grep -q "blocked on: jonathan" || fail "list lacks the reason: $($BL list | head -3)"
+$BL export -o "$T/blocked.html" >/dev/null; grep -q '"blocked_on":"jonathan"' "$T/blocked.html" || fail "page lacks the reason"
+$BL show "$bk" | grep -q "  blocked       " || fail "status column"
+$BL show "$bk" | grep -q "claimed_by=" && fail "claim survived blocking"
+$BL reap --older-than 0s 2>&1 | grep -q "#$bk" && fail "reap touched a blocked card"
+$BL board --no-color --width 120 | grep -q "BLOCKED" || fail "terminal board lacks the blocked column"
+$BL history "$bk" | grep -q "blocked_on .*→ jonathan  by parker" || fail "blocked_on event"
+$BL status "$bk" ready >/dev/null
+$BL show "$bk" | grep -q "blocked on:" && fail "ready did not clear the reason"
+$BL board --no-color --width 120 | grep -q "BLOCKED" && fail "blocked column shown with nothing blocked"
+other=$($BL create "the decision card" -p 10 | grep -o '#[0-9]*' | tr -d '#')
+$BL status "$bk" blocked --on "#$other" >/dev/null
+$BL show "$bk" | grep -q "blocked by: #$other" || fail "--on #card did not link"
+$BL status "$bk" ready >/dev/null; $BL delete "$other" --why t >/dev/null
+# a database written by the 0.4 build: notes table with a cascade FK, status CHECK without blocked
+mkdir -p "$T/v04"
+sqlite3 "$T/v04/backlog.db" <<'SQL'
+CREATE TABLE cards (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'new'
+        CHECK(status IN ('new','ready','in_progress','done')),
+    priority INTEGER NOT NULL DEFAULT 5000 CHECK(priority BETWEEN 0 AND 10000),
+    outcome TEXT NOT NULL DEFAULT '', claimed_by TEXT NOT NULL DEFAULT '', claimed_at TEXT NOT NULL DEFAULT '',
+    commits TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')), project_id INTEGER NOT NULL DEFAULT 0, legacy_id INTEGER);
+CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL UNIQUE,
+    active INTEGER NOT NULL DEFAULT 1, autoexport TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'note', author TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+    commit_subject TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')));
+INSERT INTO projects (name, path) VALUES ('v04', '/nonexistent/v04');
+INSERT INTO cards (title, notes, priority, project_id) VALUES ('kept card', '[finding] must survive the rebuild', 7000, 1);
+INSERT INTO notes (card_id, kind, body) VALUES (1, 'finding', 'must survive the rebuild');
+SQL
+$BL --db "$T/v04/backlog.db" list | grep -q "kept card" || fail "0.4 db unreadable"
+[ "$($BL --db "$T/v04/backlog.db" notes 1 | grep -c 'must survive')" = 1 ] || fail "rebuild lost or duplicated the note row: $($BL --db "$T/v04/backlog.db" notes 1)"
+$BL --db "$T/v04/backlog.db" status 1 blocked --on someone >/dev/null || fail "blocked refused on the rebuilt table"
+$BL --db "$T/v04/backlog.db" notes 1 | grep -q "must survive" || fail "note gone after blocked"
+ok "blocked status / 0.4 rebuild"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"
