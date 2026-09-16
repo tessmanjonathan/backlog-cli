@@ -769,6 +769,14 @@
           `<b>${esc(sha)}</b>${subject ? "  " + esc(subject) : ""}`).join("\n")
       }</pre></div>` : ""}
       ${c.outcome ? `<div class="block"><h3 class="label">Outcome</h3><pre>${esc(c.outcome)}</pre></div>` : ""}
+      ${(c.events && c.events.length) ? `<div class="block"><h3 class="label">Timeline</h3><pre>${
+        c.events.map((e) => {
+          const flat = (s) => { const f = String(s).replace(/\n/g, " | "); return f.length > 120 ? f.slice(0, 117) + "..." : f; };
+          const change = e.before && e.after ? `${esc(flat(e.before))} → ${esc(flat(e.after))}`
+            : e.after ? `→ ${esc(flat(e.after))}` : e.before ? `${esc(flat(e.before))} →` : "";
+          return `<span style="color:var(--ink-3)">${esc(e.at)}</span>  <b>${esc(e.kind)}</b>  ${change}${
+            e.by ? ` <span style="color:var(--ink-3)">· ${esc(e.by)}</span>` : ""}`;
+        }).join("\n")}</pre></div>` : ""}
       <div class="block">
         <h3 class="label">Inspect from the CLI</h3>
         <pre>bl show ${c.id}${state.central || !state.dbPath ? "" : ` --db ${state.dbPath}`}</pre>

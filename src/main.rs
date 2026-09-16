@@ -1,9 +1,11 @@
 mod board;
+mod events;
 mod import;
 mod notes;
 mod store;
 mod view;
 
+use events::Event;
 use notes::Note;
 use store::Project;
 
@@ -86,6 +88,22 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_card ON notes(card_id, id);
+
+-- The audit trail: one row per change to a card (status, claim, priority,
+-- title...). Never updated or deleted, and not cascaded: a deleted card's
+-- history stays readable. `before`/`after`/`by` are keywords, hence the names.
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id     INTEGER NOT NULL,
+    project_id  INTEGER NOT NULL DEFAULT 0,
+    kind        TEXT NOT NULL,
+    old_value   TEXT NOT NULL DEFAULT '',
+    new_value   TEXT NOT NULL DEFAULT '',
+    actor       TEXT NOT NULL DEFAULT '',
+    at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_card ON events(card_id, id);
 "#;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -179,6 +197,9 @@ enum Commands {
         /// If a card with this exact title exists, print its id and create nothing
         #[arg(long)]
         if_absent: bool,
+        /// Who is creating it, for the event log
+        #[arg(long)]
+        by: Option<String>,
     },
 
     /// Change any field of a card in one go
@@ -201,6 +222,9 @@ enum Commands {
         /// Move the card to another project (by name or #id)
         #[arg(long, value_name = "PROJECT")]
         r#move: Option<String>,
+        /// Who is editing, for the event log
+        #[arg(long)]
+        by: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -213,6 +237,9 @@ enum Commands {
     SetPriority {
         id: i64,
         priority: i32,
+        /// Who is re-ranking, for the event log
+        #[arg(long)]
+        by: Option<String>,
     },
 
     /// Update status (and optionally outcome). Clears claim when moving to ready/done/new.
@@ -221,6 +248,16 @@ enum Commands {
         status: Status,
         #[arg(long, default_value = "")]
         outcome: String,
+        /// Who is moving it, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Replay every change a card went through (works for deleted cards too)
+    History {
+        id: i64,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Atomically claim a card (ready → in_progress). Fails if already claimed.
@@ -754,6 +791,9 @@ pub(crate) struct Card {
     /// empty for a database old enough to lack the table.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) entries: Vec<Note>,
+    /// The audit trail, oldest first. Filled with `entries`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) events: Vec<Event>,
 }
 
 pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
@@ -774,17 +814,22 @@ pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         project: row.get::<_, String>(13).unwrap_or_default(),
         legacy_id: row.get::<_, Option<i64>>(14).unwrap_or(None),
         entries: Vec::new(),
+        events: Vec::new(),
     })
 }
 
 /// Fill in each card's notes. Skipped silently where the table is absent, so a
 /// legacy database still lists and serves.
 pub(crate) fn load_entries(conn: &Connection, cards: &mut [Card]) {
-    if !notes::table_exists(conn) {
-        return;
-    }
+    let has_notes = notes::table_exists(conn);
+    let has_events = events::table_exists(conn);
     for c in cards.iter_mut() {
-        c.entries = notes::list(conn, c.id).unwrap_or_default();
+        if has_notes {
+            c.entries = notes::list(conn, c.id).unwrap_or_default();
+        }
+        if has_events {
+            c.events = events::list(conn, c.id).unwrap_or_default();
+        }
     }
 }
 
@@ -1156,10 +1201,60 @@ struct EditFields {
     outcome: Option<String>,
     status: Option<Status>,
     move_to: Option<String>,
+    by: String,
 }
 
 /// Apply every given field in one transaction. Returns the names of the
 /// fields that changed, for the confirmation line.
+/// The fields of a card an edit or delete may need to compare against.
+struct Snapshot {
+    title: String,
+    label: String,
+    priority: i32,
+    outcome: String,
+    status: String,
+    claimed_by: String,
+    project_id: i64,
+    notes: String,
+}
+
+fn snapshot(conn: &Connection, id: i64) -> Result<Option<Snapshot>> {
+    Ok(conn
+        .query_row(
+            "SELECT title, label, priority, outcome, status, claimed_by, project_id, notes
+             FROM cards WHERE id = ?",
+            params![id],
+            |r| {
+                Ok(Snapshot {
+                    title: r.get(0)?,
+                    label: r.get(1)?,
+                    priority: r.get(2)?,
+                    outcome: r.get(3)?,
+                    status: r.get(4)?,
+                    claimed_by: r.get(5)?,
+                    project_id: r.get(6)?,
+                    notes: r.get(7)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Run `f` inside one IMMEDIATE transaction, rolling back on error.
+fn transaction<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    match f() {
+        Ok(v) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
 fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
     let conn = &ctx.conn;
     let now = now_str();
@@ -1220,32 +1315,22 @@ fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
         bail!("nothing to change: give at least one of --title --label --priority --notes --outcome --status --move");
     }
 
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
-    let result = (|| -> Result<()> {
+    transaction(conn, || -> Result<()> {
+        let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
         if !sets.is_empty() {
             sets.push("updated_at = ?".into());
             binds.push(Box::new(now.clone()));
             binds.push(Box::new(id));
             let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
-            let n = conn.execute(
+            conn.execute(
                 &format!("UPDATE cards SET {} WHERE id = ?", sets.join(", ")),
                 refs.as_slice(),
             )?;
-            if n == 0 {
-                bail!("card #{} not found", id);
-            }
-        } else {
-            let exists: Option<i64> = conn
-                .query_row("SELECT id FROM cards WHERE id = ?", params![id], |r| r.get(0))
-                .optional()?;
-            if exists.is_none() {
-                bail!("card #{} not found", id);
-            }
         }
         if let Some(text) = &f.notes {
             // Replace, not append: `bl note` appends. The rows go with the blob
             // so the two views of the notes stay one thing.
-            let old: i64 = conn.query_row(
+            let old_n: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM notes WHERE card_id = ?",
                 params![id],
                 |r| r.get(0),
@@ -1256,19 +1341,47 @@ fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
                 params![text, now, id],
             )?;
             notes::reconcile(conn, id)?;
-            if old > 0 {
-                eprintln!("bl: #{} had {} note(s); they are replaced, not kept", id, old);
+            if old_n > 0 {
+                eprintln!("bl: #{} had {} note(s); they are replaced, not kept", id, old_n);
             }
         }
-        Ok(())
-    })();
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT;")?,
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            return Err(e);
+        // One event per field that actually changed, so the history reads
+        // like a diff rather than a list of commands.
+        let ev = |kind: &str, before: &str, after: &str| -> Result<()> {
+            if before != after {
+                events::record(conn, id, Some(old.project_id), kind, before, after, &f.by, &now)?;
+            }
+            Ok(())
+        };
+        if let Some(t) = &f.title {
+            ev("title", &old.title, t.trim())?;
         }
-    }
+        if let Some(l) = &f.label {
+            ev("label", &old.label, l.trim())?;
+        }
+        if let Some(p) = f.priority {
+            ev("priority", &old.priority.to_string(), &p.to_string())?;
+        }
+        if let Some(o) = &f.outcome {
+            ev("outcome", &old.outcome, o)?;
+        }
+        if let Some(st) = &f.status {
+            ev("status", &old.status, st.as_str())?;
+            if !old.claimed_by.is_empty() && matches!(st, Status::New | Status::Ready | Status::Done) {
+                ev("release", &old.claimed_by, "")?;
+            }
+        }
+        if let Some(p) = &moved {
+            let from = store::by_id(conn, old.project_id)?
+                .map(|p| p.name)
+                .unwrap_or_else(|| old.project_id.to_string());
+            ev("move", &from, &p.name)?;
+        }
+        if let Some(text) = &f.notes {
+            ev("notes", &old.notes, text)?;
+        }
+        Ok(())
+    })?;
 
     // A move leaves the old project's page stale too, so redraw every page.
     refresh_views(ctx, if moved.is_some() { None } else { Some(id) });
@@ -1553,6 +1666,7 @@ fn main() -> Result<()> {
             priority,
             notes: notes_text,
             if_absent,
+            by,
         } => {
             if !(0..=10000).contains(&priority) {
                 bail!("priority must be 0..=10000");
@@ -1583,6 +1697,7 @@ fn main() -> Result<()> {
             if !notes_text.is_empty() {
                 notes::reconcile(conn, id)?;
             }
+            events::record(conn, id, Some(project.id), "created", "", &title, by.as_deref().unwrap_or(""), &now)?;
             println!(
                 "created #{}  priority={}  label={}  project={}",
                 id, priority, label, project.name
@@ -1599,6 +1714,7 @@ fn main() -> Result<()> {
             outcome,
             status,
             r#move,
+            by,
             json,
         } => {
             let changed = edit_card(
@@ -1612,6 +1728,7 @@ fn main() -> Result<()> {
                     outcome,
                     status,
                     move_to: r#move,
+                    by: by.unwrap_or_default(),
                 },
             )?;
             if json {
@@ -1639,52 +1756,70 @@ fn main() -> Result<()> {
             println!("#{} retitled: {}", id, title);
         }
 
-        Commands::SetPriority { id, priority } => {
+        Commands::SetPriority { id, priority, by } => {
             if !(0..=10000).contains(&priority) {
                 bail!("priority must be 0..=10000");
             }
             let now = now_str();
-            let n = conn.execute(
-                "UPDATE cards SET priority = ?1, updated_at = ?2 WHERE id = ?3",
-                params![priority, now, id],
-            )?;
-            if n == 0 {
-                bail!("card #{} not found", id);
-            }
+            transaction(conn, || {
+                let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+                conn.execute(
+                    "UPDATE cards SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![priority, now, id],
+                )?;
+                if old.priority != priority {
+                    events::record(conn, id, Some(old.project_id), "priority", &old.priority.to_string(), &priority.to_string(), by.as_deref().unwrap_or(""), &now)?;
+                }
+                Ok(())
+            })?;
             println!("#{} priority → {}", id, priority);
             refresh_views(&ctx, Some(id));
         }
 
-        Commands::Status { id, status, outcome } => {
+        Commands::Status { id, status, outcome, by } => {
             let now = now_str();
+            let who = by.unwrap_or_default();
             // Clear claim when leaving in_progress (or explicitly setting ready/new/done)
             let clear_claim = matches!(status, Status::New | Status::Ready | Status::Done);
-            let n = if outcome.is_empty() {
-                if clear_claim {
+            transaction(conn, || {
+                let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+                let n = if outcome.is_empty() {
+                    if clear_claim {
+                        conn.execute(
+                            "UPDATE cards SET status = ?1, claimed_by = '', claimed_at = '', updated_at = ?2 WHERE id = ?3",
+                            params![status.as_str(), now, id],
+                        )?
+                    } else {
+                        conn.execute(
+                            "UPDATE cards SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![status.as_str(), now, id],
+                        )?
+                    }
+                } else if clear_claim {
                     conn.execute(
-                        "UPDATE cards SET status = ?1, claimed_by = '', claimed_at = '', updated_at = ?2 WHERE id = ?3",
-                        params![status.as_str(), now, id],
+                        "UPDATE cards SET status = ?1, outcome = ?2, claimed_by = '', claimed_at = '', updated_at = ?3 WHERE id = ?4",
+                        params![status.as_str(), outcome, now, id],
                     )?
                 } else {
                     conn.execute(
-                        "UPDATE cards SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![status.as_str(), now, id],
+                        "UPDATE cards SET status = ?1, outcome = ?2, updated_at = ?3 WHERE id = ?4",
+                        params![status.as_str(), outcome, now, id],
                     )?
+                };
+                if n == 0 {
+                    bail!("card #{} not found", id);
                 }
-            } else if clear_claim {
-                conn.execute(
-                    "UPDATE cards SET status = ?1, outcome = ?2, claimed_by = '', claimed_at = '', updated_at = ?3 WHERE id = ?4",
-                    params![status.as_str(), outcome, now, id],
-                )?
-            } else {
-                conn.execute(
-                    "UPDATE cards SET status = ?1, outcome = ?2, updated_at = ?3 WHERE id = ?4",
-                    params![status.as_str(), outcome, now, id],
-                )?
-            };
-            if n == 0 {
-                bail!("card #{} not found", id);
-            }
+                if old.status != status.as_str() {
+                    events::record(conn, id, Some(old.project_id), "status", &old.status, status.as_str(), &who, &now)?;
+                }
+                if clear_claim && !old.claimed_by.is_empty() {
+                    events::record(conn, id, Some(old.project_id), "release", &old.claimed_by, "", &who, &now)?;
+                }
+                if !outcome.is_empty() && old.outcome != outcome {
+                    events::record(conn, id, Some(old.project_id), "outcome", &old.outcome, &outcome, &who, &now)?;
+                }
+                Ok(())
+            })?;
             println!("#{} status → {}", id, status);
             refresh_views(&ctx, Some(id));
         }
@@ -1695,6 +1830,8 @@ fn main() -> Result<()> {
             }
             let now = now_str();
             // Atomic claim: only if currently ready (or new) and unclaimed
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let old = snapshot(conn, id)?;
             let n = conn.execute(
                 "UPDATE cards
                  SET status = 'in_progress',
@@ -1706,7 +1843,13 @@ fn main() -> Result<()> {
                    AND (claimed_by = '' OR claimed_by IS NULL)",
                 params![by, now, id],
             )?;
-            if n == 0 {
+            if n == 1 {
+                let old = old.expect("row just updated");
+                events::record(conn, id, Some(old.project_id), "status", &old.status, "in_progress", &by, &now)?;
+                events::record(conn, id, Some(old.project_id), "claim", "", &by, &by, &now)?;
+                conn.execute_batch("COMMIT;")?;
+            } else {
+                conn.execute_batch("ROLLBACK;")?;
                 // Diagnose why
                 let row: Option<(String, String)> = conn
                     .query_row(
@@ -1737,6 +1880,8 @@ fn main() -> Result<()> {
 
         Commands::Release { id, by } => {
             let now = now_str();
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let old = snapshot(conn, id)?;
             let n = if let Some(ref agent) = by {
                 conn.execute(
                     "UPDATE cards
@@ -1761,6 +1906,15 @@ fn main() -> Result<()> {
                     params![now, id],
                 )?
             };
+            if n == 1 {
+                let old = old.expect("row just updated");
+                let who = by.clone().unwrap_or_default();
+                events::record(conn, id, Some(old.project_id), "status", &old.status, "ready", &who, &now)?;
+                events::record(conn, id, Some(old.project_id), "release", &old.claimed_by, "", &who, &now)?;
+                conn.execute_batch("COMMIT;")?;
+            } else {
+                conn.execute_batch("ROLLBACK;")?;
+            }
             if n == 0 {
                 let row: Option<(String, String)> = conn
                     .query_row(
@@ -1867,7 +2021,7 @@ fn main() -> Result<()> {
                 // Pick highest-priority new/ready unclaimed card, then claim in one transaction
                 conn.execute_batch("BEGIN IMMEDIATE;")?;
 
-                let mut sql = String::from("SELECT id FROM cards WHERE status IN ('ready'");
+                let mut sql = String::from("SELECT id, status FROM cards WHERE status IN ('ready'");
                 if !ready_only {
                     sql.push_str(", 'new'");
                 }
@@ -1884,15 +2038,15 @@ fn main() -> Result<()> {
                 }
                 sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT 1");
 
-                let id: Option<i64> = {
+                let picked: Option<(i64, String)> = {
                     let mut stmt = conn.prepare(&sql)?;
                     let params_ref: Vec<&dyn rusqlite::ToSql> =
                         binds.iter().map(|b| b.as_ref()).collect();
-                    stmt.query_row(params_ref.as_slice(), |r| r.get(0))
+                    stmt.query_row(params_ref.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
                         .optional()?
                 };
 
-                let Some(id) = id else {
+                let Some((id, prev_status)) = picked else {
                     conn.execute_batch("ROLLBACK;")?;
                     if json {
                         println!("null");
@@ -1920,6 +2074,8 @@ fn main() -> Result<()> {
                     conn.execute_batch("ROLLBACK;")?;
                     bail!("failed to claim #{} (race?)", id);
                 }
+                events::record(conn, id, None, "status", &prev_status, "in_progress", &agent, &now)?;
+                events::record(conn, id, None, "claim", "", &agent, &agent, &now)?;
 
                 conn.execute_batch("COMMIT;")?;
                 refresh_views(&ctx, Some(id));
@@ -1974,6 +2130,31 @@ fn main() -> Result<()> {
                         }
                         exit_with(EXIT_EMPTY);
                     }
+                }
+            }
+        }
+
+        Commands::History { id, json } => {
+            let evs = events::list(conn, id)?;
+            if evs.is_empty() {
+                let exists: Option<i64> = conn
+                    .query_row("SELECT id FROM cards WHERE id = ?", params![id], |r| r.get(0))
+                    .optional()?;
+                if exists.is_none() {
+                    bail!("card #{} not found and it left no history", id);
+                }
+                if json {
+                    println!("[]");
+                } else {
+                    println!("(no events; #{} predates the event log)", id);
+                }
+                exit_with(EXIT_EMPTY);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&evs)?);
+            } else {
+                for e in &evs {
+                    println!("{}", events::render_line(e));
                 }
             }
         }
@@ -2202,12 +2383,16 @@ fn main() -> Result<()> {
                     println!("#{} would be released (claimed by {} at {})", id, who, since);
                     continue;
                 }
-                conn.execute(
+                let n = conn.execute(
                     "UPDATE cards
                      SET status = 'ready', claimed_by = '', claimed_at = '', updated_at = ?1
                      WHERE id = ?2 AND status = 'in_progress' AND claimed_at = ?3",
                     params![now, id, since],
                 )?;
+                if n == 1 {
+                    events::record(conn, *id, None, "status", "in_progress", "ready", "reap", &now)?;
+                    events::record(conn, *id, None, "reap", who, "", "reap", &now)?;
+                }
                 notes::add(
                     conn,
                     *id,

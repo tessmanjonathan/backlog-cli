@@ -78,7 +78,8 @@ long one — the next agent can filter them.
 | `bl notes <id> [--kind K] [--json]` | Read a card's notes |
 | `bl heartbeat <id> --by <agent-id>` | Keep a long claim alive |
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
-| `bl status <id> <new\|ready\|in_progress\|done> [--outcome "..."]` | Move it |
+| `bl status <id> <new\|ready\|in_progress\|done> [--outcome "..."] [--by <id>]` | Move it |
+| `bl history <id> [--json]` | Every status, claim, priority and field change, with who and when |
 | `bl edit <id> [--title] [--label] [--priority] [--outcome] [--status] [--move PROJECT]` | Change a card; `bl retitle <id> "..."` for the title alone |
 | `bl set-priority <id> <0-10000>` | Re-rank |
 | `bl decay [--amount 25]` | Age everything down (scheduled, not per-task) |
@@ -93,7 +94,9 @@ are parsing rather than reading.
 2. Work only your claimed card. Never touch another agent's claim.
 3. Priority is 0–10000, higher first. Roughly: 8000+ urgent, 5000 default, under 2000 someday.
 4. Record what you found in notes as you go — the next agent only sees what you wrote down.
-   Type them (`--kind finding|decision|blocker`) and sign them (`--by <you>`).
+   Type them (`--kind finding|decision|blocker`) and sign them (`--by <you>`). Status, claim
+   and priority changes are logged for you (`bl history <id>`); pass `--by <you>` to
+   `status`, `edit` and `set-priority` so the log says who.
 5. After committing code for a card: `bl note <id> "what changed" --commit` links the sha.
 6. Finish with `bl status <id> done --outcome "..."`. The outcome is what a human reads first.
 7. Discovered extra work? `bl create` a follow-up. Don't quietly widen the card you hold.

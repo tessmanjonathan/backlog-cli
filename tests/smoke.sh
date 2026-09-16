@@ -156,5 +156,31 @@ cd "$T/alpha"; $BL list | grep -q "typo in title, fixed" && fail "card still in 
 $BL edit "$eid" --title "" 2>/dev/null && fail "empty title accepted"
 ok "edit / retitle / move"
 
+# 16. event log: every status/claim/priority/field change lands in bl history with who did it
+cd "$T/alpha"
+hid=$($BL create "audited card" -p 3000 --by minter | grep -o '#[0-9]*' | tr -d '#')
+$BL claim "$hid" --by worker >/dev/null
+$BL release "$hid" --by worker >/dev/null
+$BL set-priority "$hid" 3500 --by ranker >/dev/null
+$BL edit "$hid" --title "audited card, renamed" --label audit --by editor >/dev/null
+$BL status "$hid" done --outcome "shipped" --by closer >/dev/null
+h=$($BL history "$hid")
+echo "$h" | grep -q "created .*→ audited card  by minter" || fail "created event: $h"
+echo "$h" | grep -q "claim .*→ worker  by worker" || fail "claim event: $h"
+echo "$h" | grep -q "status .*new → in_progress  by worker" || fail "claim status event: $h"
+echo "$h" | grep -q "release .*worker →  by worker" || fail "release event: $h"
+echo "$h" | grep -q "priority .*3000 → 3500  by ranker" || fail "priority event: $h"
+echo "$h" | grep -q "title .*audited card → audited card, renamed  by editor" || fail "title event: $h"
+echo "$h" | grep -q "label .*→ audit  by editor" || fail "label event: $h"
+echo "$h" | grep -q "status .*ready → done  by closer" || fail "done event: $h"
+echo "$h" | grep -q "outcome .*→ shipped  by closer" || fail "outcome event: $h"
+[ "$($BL history "$hid" --json | grep -c '"kind"')" = 10 ] || fail "history --json count: $($BL history "$hid" --json | grep -c '"kind"')"
+nid=$($BL next --claim --by looper | grep -o '#[0-9]*' | head -1 | tr -d '#')
+$BL history "$nid" | grep -q "claim .*→ looper" || fail "next --claim not logged"
+$BL release "$nid" >/dev/null
+$BL export -o "$T/hist.html" >/dev/null; grep -q '"events":\[' "$T/hist.html" || fail "page carries no events"
+if $BL history 99999 2>/dev/null; then fail "history of a missing card should fail"; fi
+ok "event log / bl history"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

@@ -219,6 +219,10 @@ pub(crate) fn run(ctx: &Ctx, source: &Path, name: Option<&str>, dry_run: bool) -
             )?;
             let new_id = conn.last_insert_rowid();
             out.imported.push((c.id, new_id));
+            crate::events::record(
+                conn, new_id, Some(project.id), "imported",
+                &format!("#{} in {}", c.id, out.source), &c.title, "", &now,
+            )?;
 
             if c.entries.is_empty() {
                 // A source from before typed notes: the blob is all there is,
