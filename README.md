@@ -83,6 +83,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl migrate [--scan DIR]... [--dry-run]` | Import every repo-level board it can find |
 | `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent]` | New card (status=new) |
 | `bl edit <id> [--title] [--label] [--priority] [--notes] [--outcome] [--status] [--move PROJECT] [--by who] [--json]` | Change any field, all flags in one transaction |
+| `bl edit --ids 1,2,3 --priority 100` · `bl edit --where label=art --where status=new --set priority=100 [--dry-run]` | The same change on many cards; `--where` takes label, status, claimed_by, project, title with `=`/`!=` and priority, id with `< > <= >=`; every card gets its event rows |
 | `bl retitle <id> "title"` | Short for `bl edit --title` |
 | `bl delete <id> [--why "..."] [--force] [--by who]` | Remove a card; title and notes stay in `bl history <id>` (claimed cards need `--force`) |
 | `bl set-priority <id> <0-10000>` | Set priority score |

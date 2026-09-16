@@ -81,6 +81,7 @@ long one — the next agent can filter them.
 | `bl status <id> <new\|ready\|in_progress\|done> [--outcome "..."] [--by <id>]` | Move it |
 | `bl history <id> [--json]` | Every status, claim, priority and field change, with who and when |
 | `bl edit <id> [--title] [--label] [--priority] [--outcome] [--status] [--move PROJECT]` | Change a card; `bl retitle <id> "..."` for the title alone |
+| `bl edit --ids 1,2,3 --priority 100` · `bl edit --where label=art --set priority=100 [--dry-run]` | Same change on many cards; `--dry-run` lists them first |
 | `bl set-priority <id> <0-10000>` | Re-rank |
 | `bl delete <id> [--why "..."]` | Remove a card filed in error (its history survives) |
 | `bl decay [--amount 25]` | Age everything down (scheduled, not per-task) |

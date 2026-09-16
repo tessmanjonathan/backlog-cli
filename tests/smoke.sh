@@ -198,5 +198,23 @@ echo "$h" | grep -q "→ duplicate of #1  by janitor" || fail "deleted event lac
 [ "$($BL history "$did" --json | grep -c '"kind": "deleted"')" = 1 ] || fail "deleted event count"
 ok "delete keeps history"
 
+# 18. bulk edit: --ids, --where/--set, --dry-run writes nothing, each card gets an event
+cd "$T/alpha"
+b1=$($BL create "bulk a" -l art -p 1000 | grep -o '#[0-9]*' | tr -d '#')
+b2=$($BL create "bulk b" -l art -p 1100 | grep -o '#[0-9]*' | tr -d '#')
+b3=$($BL create "bulk c" -l code -p 1200 | grep -o '#[0-9]*' | tr -d '#')
+$BL edit --ids "$b1,$b2" --priority 100 --by mover | grep -q "edited 2 card(s): priority" || fail "edit --ids"
+$BL show "$b2" | grep -q "\[  100\]" || fail "--ids priority not applied"
+$BL edit --where label=art --where status=new --set priority=200 --set label=visual --dry-run | grep -q "would edit 2 card(s); nothing written" || fail "dry-run count"
+$BL show "$b1" | grep -q "\[art\]" || fail "dry-run wrote"
+$BL edit --where label=art --where status=new --set priority=200 --set label=visual | grep -q "edited 2 card(s)" || fail "where/set"
+$BL show "$b1" | grep -q "\[  200\]  new           alpha: \[visual\]" || fail "where/set not applied: $($BL show "$b1" | head -1)"
+$BL show "$b3" | grep -q "\[code\]" || fail "where touched a non-matching card"
+$BL edit --where "priority<150" --set priority=300 2>/dev/null && fail "priority<150 should match nothing now"
+[ "$($BL edit --where label=nothing-here --set priority=1 >/dev/null 2>&1; echo $?)" = 2 ] || fail "no match should exit 2"
+$BL history "$b1" | grep -q "label .*art → visual" || fail "bulk edit event missing: $($BL history "$b1")"
+if $BL edit --set priority=1 2>/dev/null; then fail "edit with no target should refuse"; fi
+ok "bulk edit"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

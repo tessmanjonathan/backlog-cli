@@ -202,9 +202,22 @@ enum Commands {
         by: Option<String>,
     },
 
-    /// Change any field of a card in one go
+    /// Change any field of one card, or of many with --ids / --where
     Edit {
-        id: i64,
+        /// The card; or use --ids / --where for several
+        id: Option<i64>,
+        /// Comma-separated card ids to change together
+        #[arg(long, value_name = "1,2,3", conflicts_with = "id")]
+        ids: Option<String>,
+        /// Select cards by field: label=art, status=new, priority<2000, project=NAME, claimed_by=X (repeatable, all must hold)
+        #[arg(long = "where", value_name = "FIELD=VALUE", conflicts_with_all = ["id", "ids"])]
+        r#where: Vec<String>,
+        /// Change a field by name: priority=100, label=visual, status=ready, outcome=..., project=NAME (repeatable)
+        #[arg(long = "set", value_name = "FIELD=VALUE")]
+        set: Vec<String>,
+        /// List the cards that would change and write nothing
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -1272,7 +1285,112 @@ fn transaction<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T>
 fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
     let conn = &ctx.conn;
     let now = now_str();
+    let (changed, moved) = transaction(conn, || apply_edit(conn, id, &f, &now))?;
+    // A move leaves the old project's page stale too, so redraw every page.
+    refresh_views(ctx, if moved { None } else { Some(id) });
+    Ok(changed)
+}
 
+/// `--set field=value` in the vocabulary of `EditFields`.
+fn parse_set(f: &mut EditFields, pair: &str) -> Result<()> {
+    let (k, v) = pair
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--set wants FIELD=VALUE, got '{}'", pair))?;
+    let v = v.to_string();
+    match k.trim() {
+        "title" => f.title = Some(v),
+        "label" => f.label = Some(v),
+        "priority" => f.priority = Some(v.trim().parse().with_context(|| format!("priority '{}' is not a number", v))?),
+        "outcome" => f.outcome = Some(v),
+        "notes" => f.notes = Some(v),
+        "status" => {
+            f.status = Some(
+                <Status as ValueEnum>::from_str(v.trim(), true)
+                    .map_err(|_| anyhow::anyhow!("status '{}' is not one of new, ready, in_progress, done", v))?,
+            )
+        }
+        "project" | "move" => f.move_to = Some(v),
+        other => bail!("--set does not know the field '{}' (title, label, priority, outcome, notes, status, project)", other),
+    }
+    Ok(())
+}
+
+/// `--where field=value` (and `priority<N`, `priority>N`, `<=`, `>=`) as an
+/// SQL clause starting with ` AND `, plus the value to bind.
+fn parse_where(conn: &Connection, expr: &str) -> Result<(String, Box<dyn rusqlite::ToSql>)> {
+    let ops = ["<=", ">=", "!=", "=", "<", ">"];
+    let (k, op, v) = ops
+        .iter()
+        .find_map(|op| expr.split_once(op).map(|(k, v)| (k.trim(), *op, v.trim())))
+        .ok_or_else(|| anyhow::anyhow!("--where wants FIELD=VALUE, got '{}'", expr))?;
+    let text_ops = matches!(op, "=" | "!=");
+    match k {
+        "priority" | "id" => {
+            let n: i64 = v.parse().with_context(|| format!("{} '{}' is not a number", k, v))?;
+            Ok((format!(" AND {} {} ?", k, op), Box::new(n)))
+        }
+        "label" | "status" | "claimed_by" | "title" | "outcome" if text_ops => {
+            Ok((format!(" AND {} {} ?", k, op), Box::new(v.to_string())))
+        }
+        "project" if text_ops => {
+            let p = store::lookup(conn, v)?.ok_or_else(|| anyhow::anyhow!("no project named '{}'", v))?;
+            Ok((format!(" AND project_id {} ?", op), Box::new(p.id)))
+        }
+        _ => bail!(
+            "--where does not understand '{}' (label, status, claimed_by, title, outcome, project with = or !=; priority, id with = != < > <= >=)",
+            expr
+        ),
+    }
+}
+
+/// The cards `--where` selects, inside the current scope, lowest id first.
+fn select_where(ctx: &Ctx, wheres: &[String]) -> Result<Vec<(i64, String)>> {
+    let conn = &ctx.conn;
+    let mut sql = String::from("SELECT id, title FROM cards WHERE 1=1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let (scope, pid) = ctx.scope();
+    sql.push_str(&scope);
+    if let Some(pid) = pid {
+        binds.push(Box::new(pid));
+    }
+    for w in wheres {
+        let (clause, bind) = parse_where(conn, w)?;
+        sql.push_str(&clause);
+        binds.push(bind);
+    }
+    sql.push_str(" ORDER BY id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Apply the same change to several cards in one transaction; every card
+/// gets its own event rows. Returns the fields changed on the first card.
+fn bulk_edit(ctx: &Ctx, ids: &[i64], f: &EditFields) -> Result<Vec<String>> {
+    let conn = &ctx.conn;
+    let now = now_str();
+    let mut changed = Vec::new();
+    transaction(conn, || {
+        for id in ids {
+            let (c, _) = apply_edit(conn, *id, f, &now)?;
+            if changed.is_empty() {
+                changed = c;
+            }
+        }
+        Ok(())
+    })?;
+    refresh_views(ctx, None);
+    Ok(changed)
+}
+
+/// Every field of one edit, inside the caller's transaction. Returns the
+/// names of the fields that changed and whether the card moved project.
+fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(Vec<String>, bool)> {
     let mut sets: Vec<String> = Vec::new();
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     let mut changed: Vec<String> = Vec::new();
@@ -1329,11 +1447,11 @@ fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
         bail!("nothing to change: give at least one of --title --label --priority --notes --outcome --status --move");
     }
 
-    transaction(conn, || -> Result<()> {
+    {
         let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
         if !sets.is_empty() {
             sets.push("updated_at = ?".into());
-            binds.push(Box::new(now.clone()));
+            binds.push(Box::new(now.to_string()));
             binds.push(Box::new(id));
             let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
             conn.execute(
@@ -1363,7 +1481,7 @@ fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
         // like a diff rather than a list of commands.
         let ev = |kind: &str, before: &str, after: &str| -> Result<()> {
             if before != after {
-                events::record(conn, id, Some(old.project_id), kind, before, after, &f.by, &now)?;
+                events::record(conn, id, Some(old.project_id), kind, before, after, &f.by, now)?;
             }
             Ok(())
         };
@@ -1394,12 +1512,8 @@ fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
         if let Some(text) = &f.notes {
             ev("notes", &old.notes, text)?;
         }
-        Ok(())
-    })?;
-
-    // A move leaves the old project's page stale too, so redraw every page.
-    refresh_views(ctx, if moved.is_some() { None } else { Some(id) });
-    Ok(changed)
+    }
+    Ok((changed, moved.is_some()))
 }
 
 // ---------------------------------------------------------------- delete
@@ -1762,6 +1876,10 @@ fn main() -> Result<()> {
 
         Commands::Edit {
             id,
+            ids,
+            r#where,
+            set,
+            dry_run,
             title,
             label,
             priority,
@@ -1772,30 +1890,82 @@ fn main() -> Result<()> {
             by,
             json,
         } => {
-            let changed = edit_card(
-                &ctx,
-                id,
-                EditFields {
-                    title,
-                    label,
-                    priority,
-                    notes: notes_text,
-                    outcome,
-                    status,
-                    move_to: r#move,
-                    by: by.unwrap_or_default(),
-                },
-            )?;
-            if json {
-                let mut c: Card = conn.query_row(
-                    &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
-                    params![id],
-                    row_to_card,
-                )?;
-                load_entries(conn, std::slice::from_mut(&mut c));
-                print_card(&c, true, true);
+            let mut fields = EditFields {
+                title,
+                label,
+                priority,
+                notes: notes_text,
+                outcome,
+                status,
+                move_to: r#move,
+                by: by.unwrap_or_default(),
+            };
+            for pair in &set {
+                parse_set(&mut fields, pair)?;
+            }
+            // One card: the original verb. Several: --ids or --where.
+            let targets: Vec<(i64, String)> = if let Some(id) = id {
+                vec![(id, String::new())]
+            } else if let Some(list) = &ids {
+                let mut out = Vec::new();
+                for part in list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                    let n: i64 = part.trim_start_matches('#').parse()
+                        .with_context(|| format!("'{}' is not a card id", part))?;
+                    let title: String = conn
+                        .query_row("SELECT title FROM cards WHERE id = ?", params![n], |r| r.get(0))
+                        .optional()?
+                        .ok_or_else(|| anyhow::anyhow!("card #{} not found", n))?;
+                    out.push((n, title));
+                }
+                out
+            } else if !r#where.is_empty() {
+                select_where(&ctx, &r#where)?
             } else {
-                println!("#{} edited: {}", id, changed.join(", "));
+                bail!("which card? give an id, --ids 1,2,3 or --where FIELD=VALUE");
+            };
+            let bulk = id.is_none();
+            if bulk && targets.is_empty() {
+                println!("(no cards match)");
+                exit_with(EXIT_EMPTY);
+            }
+            if dry_run {
+                for (n, t) in &targets {
+                    println!("#{}  {}", n, t);
+                }
+                println!("would edit {} card(s); nothing written", targets.len());
+                return Ok(());
+            }
+            if bulk {
+                let only: Vec<i64> = targets.iter().map(|(n, _)| *n).collect();
+                let changed = bulk_edit(&ctx, &only, &fields)?;
+                if json {
+                    let list = only.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                    let mut cards: Vec<Card> = {
+                        let mut stmt = conn.prepare(&format!(
+                            "SELECT {} FROM cards WHERE id IN ({}) ORDER BY id", SELECT_COLS, list
+                        ))?;
+                        let rows = stmt.query_map([], row_to_card)?;
+                        rows.filter_map(|r| r.ok()).collect()
+                    };
+                    load_entries(conn, &mut cards);
+                    println!("{}", serde_json::to_string_pretty(&cards)?);
+                } else {
+                    println!("edited {} card(s): {}", only.len(), changed.join(", "));
+                }
+            } else {
+                let id = targets[0].0;
+                let changed = edit_card(&ctx, id, fields)?;
+                if json {
+                    let mut c: Card = conn.query_row(
+                        &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
+                        params![id],
+                        row_to_card,
+                    )?;
+                    load_entries(conn, std::slice::from_mut(&mut c));
+                    print_card(&c, true, true);
+                } else {
+                    println!("#{} edited: {}", id, changed.join(", "));
+                }
             }
         }
 
