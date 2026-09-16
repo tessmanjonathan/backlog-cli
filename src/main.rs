@@ -25,6 +25,11 @@ pub(crate) const DEFAULT_DB: &str = "backlog.db";
 const EXIT_EMPTY: i32 = 2;
 const EXIT_CONTENDED: i32 = 3;
 
+/// What `ensure_schema` brings a database up to, stamped in `meta`.
+/// 1 cards · 2 claims · 3 typed notes · 4 projects and the central store ·
+/// 5 events, links, tags and the blocked status.
+const SCHEMA_VERSION: i64 = 5;
+
 /// Print anything buffered, then leave with a code the caller can test.
 fn exit_with(code: i32) -> ! {
     use std::io::Write;
@@ -159,8 +164,17 @@ impl std::fmt::Display for Status {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "bl", about = "Lightweight Kanban backlog for Claude Code agents")]
+#[command(
+    name = "bl",
+    about = "Lightweight Kanban backlog for Claude Code agents",
+    disable_version_flag = true,
+    arg_required_else_help = true
+)]
 struct Cli {
+    /// Print the bl version and the schema version of the database it would open
+    #[arg(short = 'V', long, global = true)]
+    version: bool,
+
     /// Use this database instead of the central store (also $BL_DB)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
@@ -175,7 +189,7 @@ struct Cli {
     all: bool,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -719,7 +733,7 @@ impl Ctx {
 /// creates a file: an empty board minted in the wrong directory is how every
 /// wrapper script and hook around this tool came to exist. `bl init` is the
 /// only command that creates.
-fn open_ctx(cli: &Cli) -> Result<Ctx> {
+fn open_ctx(cli: &Cli, command: &Commands) -> Result<Ctx> {
     let (path, central) = match store::target(cli.db.as_deref())? {
         store::Target::Explicit(p) => (p, false),
         store::Target::Central(p) => (p, true),
@@ -739,7 +753,7 @@ fn open_ctx(cli: &Cli) -> Result<Ctx> {
     // A repository that still carries its own backlog.db and is not registered
     // in the store keeps working against that file, so nothing breaks between
     // creating the store and importing each project into it.
-    if central && project.is_none() && cli.project.is_none() && !cli.command.wants_store() {
+    if central && project.is_none() && cli.project.is_none() && !command.wants_store() {
         let local = PathBuf::from(DEFAULT_DB);
         if local.exists() {
             eprintln!(
@@ -903,6 +917,56 @@ fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
         )?;
     }
 
+    // Stamp what this build brought the database to. Only ever moves up, so
+    // a newer build's mark is not undone by an older one opening the file.
+    let stamped: i64 = meta_get(conn, "schema_version")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if stamped < SCHEMA_VERSION {
+        meta_set(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// `bl --version`: the binary's version and, when a database can be found,
+/// the schema version stamped in it. Read-only: asking does not migrate.
+fn print_version(cli: &Cli) -> Result<()> {
+    println!("bl {}  (schema {})", env!("CARGO_PKG_VERSION"), SCHEMA_VERSION);
+    let path = match store::target(cli.db.as_deref()) {
+        Ok(store::Target::Explicit(p)) | Ok(store::Target::Central(p)) | Ok(store::Target::RepoLocal(p)) => p,
+        Err(_) => {
+            println!("database: none found (`bl init` creates the store)");
+            return Ok(());
+        }
+    };
+    if !path.exists() {
+        println!("database: {} (missing)", path.display());
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let has_meta: bool = conn
+        .query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'", [], |_| Ok(()))
+        .optional()?
+        .is_some();
+    let stamped: Option<i64> = if has_meta {
+        meta_get(&conn, "schema_version")?.and_then(|v| v.parse().ok())
+    } else {
+        None
+    };
+    let verdict = match stamped {
+        Some(v) if v == SCHEMA_VERSION => "current".to_string(),
+        Some(v) if v < SCHEMA_VERSION => format!("older; the next command brings it to {}", SCHEMA_VERSION),
+        Some(v) => format!("written by a newer bl (schema {}); upgrade this binary", v),
+        None => format!("unstamped, written before 0.5; the next command brings it to {}", SCHEMA_VERSION),
+    };
+    println!(
+        "database: {}  schema {}  ({})",
+        path.display(),
+        stamped.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
+        verdict
+    );
     Ok(())
 }
 
@@ -2142,20 +2206,28 @@ fn main() -> Result<()> {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    if cli.version {
+        return print_version(&cli);
+    }
+    let Some(command) = cli.command.take() else {
+        // clap prints help for a bare `bl`; a lone global flag lands here.
+        bail!("no command given; `bl --help` lists them");
+    };
 
     // Init creates files; nothing else may, so it is handled before a
     // database is opened.
-    if matches!(cli.command, Commands::Init) {
+    if matches!(command, Commands::Init) {
         return init(&cli);
     }
 
-    let ctx = open_ctx(&cli)?;
+    let ctx = open_ctx(&cli, &command)?;
     let conn = &ctx.conn;
     // Listings that span projects say which project each card is from.
     let multi = ctx.project.is_none() || ctx.all;
 
-    match cli.command {
+    match command {
         Commands::Init => unreachable!("handled above"),
 
         Commands::Project { action } => project_cmd(&ctx, action)?,

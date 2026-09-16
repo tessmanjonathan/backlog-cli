@@ -379,5 +379,18 @@ $BL --db "$T/v04/backlog.db" status 1 blocked --on someone >/dev/null || fail "b
 $BL --db "$T/v04/backlog.db" notes 1 | grep -q "must survive" || fail "note gone after blocked"
 ok "blocked status / 0.4 rebuild"
 
+# 26. --version: package version plus the schema stamp of the database it would open, without migrating it
+cd "$T/alpha"
+$BL --version | grep -q "^bl [0-9][0-9.]*  (schema [0-9]*)" || fail "--version header: $($BL --version)"
+$BL --version | grep -q "schema 5  (current)" || fail "store not stamped current: $($BL --version)"
+mkdir -p "$T/v04b"; sqlite3 "$T/v04b/backlog.db" "CREATE TABLE cards (id INTEGER PRIMARY KEY, title TEXT NOT NULL, notes TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'new' CHECK(status IN ('new','ready','in_progress','done')), priority INTEGER NOT NULL DEFAULT 5000, outcome TEXT NOT NULL DEFAULT '', claimed_by TEXT NOT NULL DEFAULT '', claimed_at TEXT NOT NULL DEFAULT '', commits TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')));"
+$BL --db "$T/v04b/backlog.db" --version | grep -q "schema ?  (unstamped" || fail "old db not reported unstamped: $($BL --db "$T/v04b/backlog.db" --version)"
+sqlite3 "$T/v04b/backlog.db" "SELECT name FROM sqlite_master WHERE name='meta'" | grep -q meta && fail "--version migrated the database"
+$BL --db "$T/v04b/backlog.db" list >/dev/null 2>&1
+$BL --db "$T/v04b/backlog.db" --version | grep -q "schema 5  (current)" || fail "db not stamped after a command"
+cd "$T/nowhere-$$" 2>/dev/null || mkdir -p "$T/nowhere" && cd "$T/nowhere"
+BL_HOME="$T/empty-home" $BL --version | grep -q "database: none found" || fail "no-db case: $(BL_HOME="$T/empty-home" $BL --version)"
+ok "--version / schema stamp"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"
