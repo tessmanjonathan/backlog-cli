@@ -128,5 +128,14 @@ cd "$T/gamma"; rm backlog.db
 $BL list | grep -q "gamma local" || fail "gamma not served from the store after migrate"
 ok "migrate --scan"
 
+# 14. the store-wide page carries the project list and marks the store; a scoped page names its project
+cd "$T"; $BL export -o "$T/all.html" >/dev/null
+grep -q '"projects":\[' "$T/all.html" || fail "store page has no projects list"
+grep -q '"central":true' "$T/all.html" || fail "store page not marked central"
+grep -q 'id="projectpick"' "$T/all.html" || fail "no project picker in page"
+cd "$T/alpha"; $BL export -o "$T/alpha2.html" >/dev/null
+grep -q '"project":{"id":[0-9]*,"name":"alpha"' "$T/alpha2.html" || fail "scoped page not scoped to alpha"
+ok "page carries projects"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

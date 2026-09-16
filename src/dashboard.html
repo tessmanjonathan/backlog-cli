@@ -375,6 +375,13 @@
     color: var(--ink-2);
     border: 1px solid var(--line-soft);
   }
+  .chip.project {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: transparent;
+  }
+  .bar-row.pick { cursor: pointer; }
+  .bar-row.pick:hover .name { color: var(--accent); }
   .chip.agent {
     background: var(--s-prog-bg);
     color: var(--s-prog);
@@ -461,6 +468,7 @@
 <header>
   <div class="wordmark">bl<span>/</span>board</div>
   <select id="dbpick" aria-label="Database"></select>
+  <select id="projectpick" aria-label="Project" hidden></select>
   <div class="dbpath" id="dbpath" title=""></div>
   <div class="spacer"></div>
   <label class="label" for="labelpick">label</label>
@@ -482,6 +490,10 @@
   <section class="strip" id="strip" aria-label="Summary"></section>
 
   <div class="panels">
+    <section class="panel" id="projectpanel" hidden>
+      <h2 class="label">Open cards by project</h2>
+      <div class="bars" id="projectbars"></div>
+    </section>
     <section class="panel">
       <h2 class="label">Open cards by label</h2>
       <div class="bars" id="labelbars"></div>
@@ -524,7 +536,14 @@
   ];
 
   const $ = (id) => document.getElementById(id);
-  const state = { cards: [], db: 0, label: "", doneLimit: 20, selected: null };
+  const state = { cards: [], db: 0, label: "", doneLimit: 20, selected: null,
+                  project: "", projects: [], scoped: null };
+
+  // The project filter lives in the query string so a link keeps it, and in
+  // localStorage so the page reopens where it was left.
+  const params = new URLSearchParams(location.search);
+  if (params.has("project")) state.project = params.get("project");
+  else { try { state.project = localStorage.getItem("bl.project") || ""; } catch (e) {} }
 
   // --- helpers -------------------------------------------------------------
 
@@ -559,11 +578,19 @@
     return `color-mix(in oklab, var(--heat-hot) ${Math.round(t * 100)}%, var(--heat-cold))`;
   };
 
+  // Cards of the chosen project (or all), before the label filter.
+  const inProject = () =>
+    state.project ? state.cards.filter((c) => c.project === state.project) : state.cards;
+
   const visible = () => {
-    let cards = state.cards;
+    let cards = inProject();
     if (state.label) cards = cards.filter((c) => c.label === state.label);
     return cards;
   };
+
+  // More than one project on screen: name it on every card.
+  const spanning = () => !state.project && !state.scoped &&
+    new Set(state.cards.map((c) => c.project).filter(Boolean)).size > 1;
 
   // --- rendering -----------------------------------------------------------
 
@@ -600,6 +627,25 @@
         <div class="label">${esc(k)}</div>
         <div class="v">${esc(v)}</div>
         <div class="sub">${esc(sub)}</div>
+      </div>`).join("");
+  }
+
+  function renderProjectBars() {
+    const panel = $("projectpanel");
+    const names = [...new Set(state.cards.map((c) => c.project).filter(Boolean))];
+    if (state.scoped || names.length < 2) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const open = state.cards.filter((c) => c.status !== "done");
+    const counts = new Map(names.map((n) => [n, 0]));
+    for (const c of open) if (c.project) counts.set(c.project, counts.get(c.project) + 1);
+    const rows = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const max = Math.max(1, ...rows.map((r) => r[1]));
+    $("projectbars").innerHTML = rows.map(([name, n]) => `
+      <div class="bar-row pick" data-project="${esc(name)}" title="Show only ${esc(name)}"
+           style="${state.project === name ? "font-weight:600" : ""}">
+        <div class="name">${esc(name)}</div>
+        <div class="track"><div style="width:${(n / max) * 100}%;background:var(--accent)"></div></div>
+        <div class="n">${n}</div>
       </div>`).join("");
   }
 
@@ -640,6 +686,8 @@
     const agentChip = c.claimed_by
       ? `<span class="chip agent">@${esc(c.claimed_by)}</span>` : "";
     const labelChip = c.label ? `<span class="chip">${esc(c.label)}</span>` : "";
+    const projectChip = spanning() && c.project
+      ? `<span class="chip project">${esc(c.project)}</span>` : "";
     const outcomeChip = c.status === "done" && c.outcome
       ? `<span class="chip done">outcome</span>` : "";
     return `
@@ -647,7 +695,7 @@
               aria-current="${state.selected === c.id}">
         <div class="top">
           <span class="id">#${c.id}</span>
-          ${labelChip}
+          ${projectChip}${labelChip}
           <span class="pri">${c.priority}</span>
         </div>
         <div class="title">${esc(c.title)}</div>
@@ -699,10 +747,12 @@
         <h2>${esc(c.title)}</h2>
       </div>
       <dl class="kv">
+        ${c.project ? `<dt>Project</dt><dd>${esc(c.project)}</dd>` : ""}
         <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}</dd>
         <dt>Priority</dt><dd style="color:${heat(c.priority)}">${c.priority}</dd>
         <dt>Label</dt><dd>${esc(c.label || "—")}</dd>
         <dt>Claimed</dt><dd>${c.claimed_by ? esc("@" + c.claimed_by) + " · " + esc(full(c.claimed_at)) : "—"}</dd>
+        ${c.legacy_id ? `<dt>Imported</dt><dd>was #${c.legacy_id} in the repo board</dd>` : ""}
         <dt>Created</dt><dd>${esc(full(c.created_at))}</dd>
         <dt>Updated</dt><dd>${esc(full(c.updated_at))} <span style="color:var(--ink-3)">(${esc(ago(c.updated_at))})</span></dd>
       </dl>
@@ -721,7 +771,7 @@
       ${c.outcome ? `<div class="block"><h3 class="label">Outcome</h3><pre>${esc(c.outcome)}</pre></div>` : ""}
       <div class="block">
         <h3 class="label">Inspect from the CLI</h3>
-        <pre>bl show ${c.id}${state.dbPath ? ` --db ${state.dbPath}` : ""}</pre>
+        <pre>bl show ${c.id}${state.central || !state.dbPath ? "" : ` --db ${state.dbPath}`}</pre>
       </div>`;
     rail.hidden = false;
     scrim.hidden = false;
@@ -731,7 +781,7 @@
   function select(id) {
     state.selected = id;
     // Keep the card in the URL so a board view can be linked to directly.
-    history.replaceState(null, "", id ? "#card-" + id : location.pathname);
+    history.replaceState(null, "", location.pathname + location.search + (id ? "#card-" + id : ""));
     renderRail();
     renderBoard(visible());
   }
@@ -740,6 +790,7 @@
 
   function renderAll() {
     const cards = visible();
+    renderProjectBars();
     renderStrip(cards);
     renderLabelBars(cards);
     renderHist(cards);
@@ -750,7 +801,7 @@
   // --- data ----------------------------------------------------------------
 
   function syncLabelPicker() {
-    const labels = [...new Set(state.cards.map((c) => c.label).filter(Boolean))].sort();
+    const labels = [...new Set(inProject().map((c) => c.label).filter(Boolean))].sort();
     const pick = $("labelpick");
     const want = ["", ...labels].join("|");
     if (pick.dataset.sig === want) return;
@@ -761,11 +812,54 @@
     state.label = pick.value;
   }
 
+  function syncProjectPicker() {
+    const pick = $("projectpick");
+    const names = [...new Set(state.cards.map((c) => c.project).filter(Boolean))].sort();
+    if (state.scoped || names.length < 2) {
+      pick.hidden = true;
+      if (state.scoped) state.project = "";
+      return;
+    }
+    pick.hidden = false;
+    const want = ["", ...names].join("|");
+    if (pick.dataset.sig !== want) {
+      pick.dataset.sig = want;
+      pick.innerHTML = `<option value="">all projects</option>` +
+        names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    }
+    if (state.project && !names.includes(state.project)) state.project = "";
+    pick.value = state.project;
+  }
+
+  function setProject(name) {
+    state.project = name;
+    try { localStorage.setItem("bl.project", name); } catch (e) {}
+    const url = new URL(location.href);
+    if (name) url.searchParams.set("project", name); else url.searchParams.delete("project");
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
+    // A card from another project stays selected only if it is still on screen.
+    const sel = state.cards.find((c) => c.id === state.selected);
+    if (sel && name && sel.project !== name) state.selected = null;
+    syncProjectPicker();
+    syncLabelPicker();
+    renderAll();
+  }
+
   function apply(data) {
     state.cards = data.cards;
     state.dbPath = data.db.path;
-    $("dbpath").innerHTML = `<bdi>${esc(data.db.path)}</bdi>`;
-    $("dbpath").title = data.db.path;
+    state.central = !!data.db.central;
+    state.projects = data.projects || [];
+    state.scoped = data.project || null;
+    const where = state.scoped ? `${state.scoped.name} · ${data.db.path}` : data.db.path;
+    $("dbpath").innerHTML = `<bdi>${esc(where)}</bdi>`;
+    $("dbpath").title = where;
+
+    // A deep link into a project that is filtered out: follow the link.
+    const linkedCard = state.cards.find((c) => c.id === state.selected);
+    if (linkedCard && state.project && linkedCard.project !== state.project) {
+      state.project = linkedCard.project || "";
+    }
 
     const pick = $("dbpick");
     const sig = data.databases.map((d) => d.label).join("|");
@@ -777,6 +871,7 @@
     pick.value = String(data.db.index);
     pick.hidden = data.databases.length < 2;
 
+    syncProjectPicker();
     syncLabelPicker();
     $("banner").hidden = true;
     renderAll();
@@ -819,6 +914,11 @@
     state.db = Number(e.target.value);
     state.selected = null;
     load();
+  });
+  $("projectpick").addEventListener("change", (e) => setProject(e.target.value));
+  document.addEventListener("click", (e) => {
+    const row = e.target.closest(".bar-row.pick");
+    if (row) setProject(state.project === row.dataset.project ? "" : row.dataset.project);
   });
   $("labelpick").addEventListener("change", (e) => {
     state.label = e.target.value;

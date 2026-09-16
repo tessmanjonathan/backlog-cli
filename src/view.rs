@@ -33,6 +33,17 @@ struct DbRef {
     index: usize,
     label: String,
     path: String,
+    /// The shared store: `bl show <id>` works from any registered repository,
+    /// so the page's CLI hint needs no `--db`.
+    central: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ProjectRef {
+    id: i64,
+    name: String,
+    active: bool,
+    path: String,
 }
 
 #[derive(serde::Serialize)]
@@ -40,6 +51,10 @@ struct Feed {
     db: DbRef,
     databases: Vec<DbRef>,
     generated_at: String,
+    /// The one project this feed is scoped to, if any.
+    project: Option<ProjectRef>,
+    /// Every project in the database, so the page can offer a selector.
+    projects: Vec<ProjectRef>,
     cards: Vec<Card>,
 }
 
@@ -259,14 +274,55 @@ fn feed(sources: &[Source], idx: usize) -> Result<Feed> {
             .unwrap_or_else(|_| s.path.clone())
             .display()
             .to_string(),
+        central: s.active_only,
     };
+    let projects = read_projects(&src.path)?;
+    let project = src
+        .project
+        .and_then(|id| projects.iter().find(|p| p.id == id).cloned());
     let feed = Feed {
         db: dbref(idx, src),
         databases: sources.iter().enumerate().map(|(i, s)| dbref(i, s)).collect(),
         generated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        project,
+        projects,
         cards: read_cards(&src.path, src.project, src.active_only)?,
     };
     Ok(feed)
+}
+
+/// The projects table, read-only; empty for a database that predates it.
+fn read_projects(path: &Path) -> Result<Vec<ProjectRef>> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("failed to open {}", path.display()))?;
+    let has: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT id, name, active, path FROM projects ORDER BY name")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ProjectRef {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            active: r.get::<_, i64>(2)? != 0,
+            path: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 /// Reads every card in scope, highest priority first. Opened read-only: the
