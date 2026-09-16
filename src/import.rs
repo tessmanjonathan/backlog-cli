@@ -150,7 +150,10 @@ pub(crate) fn run(ctx: &Ctx, source: &Path, name: Option<&str>, dry_run: bool) -
         },
     };
 
-    let cards = view::read_cards(&src, None, false)?;
+    // In old-id order, so an empty store gives the same numbers back and a
+    // non-empty one at least keeps the cards' relative order.
+    let mut cards = view::read_cards(&src, None, false)?;
+    cards.sort_by_key(|c| c.id);
 
     let existing: BTreeMap<i64, i64> = {
         let mut stmt = conn.prepare(
