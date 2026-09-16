@@ -181,6 +181,33 @@ enum Commands {
         if_absent: bool,
     },
 
+    /// Change any field of a card in one go
+    Edit {
+        id: i64,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Replace every note on the card with this text (one note per line)
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Moves like `bl status`: leaving in_progress clears the claim
+        #[arg(long)]
+        status: Option<Status>,
+        /// Move the card to another project (by name or #id)
+        #[arg(long, value_name = "PROJECT")]
+        r#move: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Change a card's title (short for `bl edit <id> --title`)
+    Retitle { id: i64, title: String },
+
     /// Set priority score (0-10000)
     #[command(name = "set-priority")]
     SetPriority {
@@ -1118,6 +1145,136 @@ fn link_commit(existing: &str, sha: &str, subject: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------- edit
+
+#[derive(Default)]
+struct EditFields {
+    title: Option<String>,
+    label: Option<String>,
+    priority: Option<i32>,
+    notes: Option<String>,
+    outcome: Option<String>,
+    status: Option<Status>,
+    move_to: Option<String>,
+}
+
+/// Apply every given field in one transaction. Returns the names of the
+/// fields that changed, for the confirmation line.
+fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
+    let conn = &ctx.conn;
+    let now = now_str();
+
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+
+    if let Some(t) = &f.title {
+        if t.trim().is_empty() {
+            bail!("a title cannot be empty");
+        }
+        sets.push("title = ?".into());
+        binds.push(Box::new(t.trim().to_string()));
+        changed.push("title".into());
+    }
+    if let Some(l) = &f.label {
+        sets.push("label = ?".into());
+        binds.push(Box::new(l.trim().to_string()));
+        changed.push("label".into());
+    }
+    if let Some(p) = f.priority {
+        if !(0..=10000).contains(&p) {
+            bail!("priority must be 0..=10000");
+        }
+        sets.push("priority = ?".into());
+        binds.push(Box::new(p));
+        changed.push("priority".into());
+    }
+    if let Some(o) = &f.outcome {
+        sets.push("outcome = ?".into());
+        binds.push(Box::new(o.clone()));
+        changed.push("outcome".into());
+    }
+    if let Some(st) = &f.status {
+        sets.push("status = ?".into());
+        binds.push(Box::new(st.as_str().to_string()));
+        // The same rule as `bl status`: leaving in_progress drops the claim.
+        if matches!(st, Status::New | Status::Ready | Status::Done) {
+            sets.push("claimed_by = ''".into());
+            sets.push("claimed_at = ''".into());
+        }
+        changed.push("status".into());
+    }
+    let mut moved: Option<Project> = None;
+    if let Some(key) = &f.move_to {
+        let p = store::lookup(conn, key)?
+            .ok_or_else(|| anyhow::anyhow!("no project named '{}'", key))?;
+        sets.push("project_id = ?".into());
+        binds.push(Box::new(p.id));
+        changed.push(format!("project → {}", p.name));
+        moved = Some(p);
+    }
+    if f.notes.is_some() {
+        changed.push("notes".into());
+    }
+    if changed.is_empty() {
+        bail!("nothing to change: give at least one of --title --label --priority --notes --outcome --status --move");
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        if !sets.is_empty() {
+            sets.push("updated_at = ?".into());
+            binds.push(Box::new(now.clone()));
+            binds.push(Box::new(id));
+            let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+            let n = conn.execute(
+                &format!("UPDATE cards SET {} WHERE id = ?", sets.join(", ")),
+                refs.as_slice(),
+            )?;
+            if n == 0 {
+                bail!("card #{} not found", id);
+            }
+        } else {
+            let exists: Option<i64> = conn
+                .query_row("SELECT id FROM cards WHERE id = ?", params![id], |r| r.get(0))
+                .optional()?;
+            if exists.is_none() {
+                bail!("card #{} not found", id);
+            }
+        }
+        if let Some(text) = &f.notes {
+            // Replace, not append: `bl note` appends. The rows go with the blob
+            // so the two views of the notes stay one thing.
+            let old: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM notes WHERE card_id = ?",
+                params![id],
+                |r| r.get(0),
+            )?;
+            conn.execute("DELETE FROM notes WHERE card_id = ?", params![id])?;
+            conn.execute(
+                "UPDATE cards SET notes = ?1, updated_at = ?2 WHERE id = ?3",
+                params![text, now, id],
+            )?;
+            notes::reconcile(conn, id)?;
+            if old > 0 {
+                eprintln!("bl: #{} had {} note(s); they are replaced, not kept", id, old);
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT;")?,
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(e);
+        }
+    }
+
+    // A move leaves the old project's page stale too, so redraw every page.
+    refresh_views(ctx, if moved.is_some() { None } else { Some(id) });
+    Ok(changed)
+}
+
 // ---------------------------------------------------------------- init
 
 /// The only command that creates a database. Without `--db` it creates the
@@ -1431,6 +1588,55 @@ fn main() -> Result<()> {
                 id, priority, label, project.name
             );
             refresh_views(&ctx, Some(id));
+        }
+
+        Commands::Edit {
+            id,
+            title,
+            label,
+            priority,
+            notes: notes_text,
+            outcome,
+            status,
+            r#move,
+            json,
+        } => {
+            let changed = edit_card(
+                &ctx,
+                id,
+                EditFields {
+                    title,
+                    label,
+                    priority,
+                    notes: notes_text,
+                    outcome,
+                    status,
+                    move_to: r#move,
+                },
+            )?;
+            if json {
+                let mut c: Card = conn.query_row(
+                    &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
+                    params![id],
+                    row_to_card,
+                )?;
+                load_entries(conn, std::slice::from_mut(&mut c));
+                print_card(&c, true, true);
+            } else {
+                println!("#{} edited: {}", id, changed.join(", "));
+            }
+        }
+
+        Commands::Retitle { id, title } => {
+            edit_card(
+                &ctx,
+                id,
+                EditFields {
+                    title: Some(title.clone()),
+                    ..Default::default()
+                },
+            )?;
+            println!("#{} retitled: {}", id, title);
         }
 
         Commands::SetPriority { id, priority } => {

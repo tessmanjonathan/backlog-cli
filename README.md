@@ -82,6 +82,8 @@ bl decay --amount 25   # run daily / on schedule
 | `bl import <backlog.db> [--project N] [--dry-run] [--json]` | Copy a repo-level board into the store |
 | `bl migrate [--scan DIR]... [--dry-run]` | Import every repo-level board it can find |
 | `bl create "title" [-l label] [-p 0-10000] [-n notes] [--if-absent]` | New card (status=new) |
+| `bl edit <id> [--title] [--label] [--priority] [--notes] [--outcome] [--status] [--move PROJECT] [--json]` | Change any field, all flags in one transaction |
+| `bl retitle <id> "title"` | Short for `bl edit --title` |
 | `bl set-priority <id> <0-10000>` | Set priority score |
 | `bl status <id> <new\|ready\|done> [--outcome "..."]` | Move status |
 | `bl list [-l label] [-s new,ready] [-n 30] [--json]` | List ordered by priority |

@@ -137,5 +137,24 @@ cd "$T/alpha"; $BL export -o "$T/alpha2.html" >/dev/null
 grep -q '"project":{"id":[0-9]*,"name":"alpha"' "$T/alpha2.html" || fail "scoped page not scoped to alpha"
 ok "page carries projects"
 
+# 15. edit and retitle: several fields in one go, notes replaced, move between projects
+cd "$T/alpha"
+eid=$($BL create "typo in tilte" -l ui -p 4000 | grep -o '#[0-9]*' | tr -d '#')
+$BL retitle "$eid" "typo in title, fixed" | grep -q "retitled" || fail "retitle"
+$BL show "$eid" | grep -q "typo in title, fixed" || fail "retitle not applied"
+$BL edit "$eid" --label polish --priority 6500 --status ready | grep -q "label, priority, status" || fail "edit fields"
+$BL show "$eid" | grep -q "\[ 6500\]  ready         alpha: \[polish\]" || fail "edit not applied: $($BL show "$eid" | head -1)"
+$BL note "$eid" "first note" >/dev/null
+$BL edit "$eid" --notes "replaced line one
+replaced line two" 2>/dev/null | grep -q "notes" || fail "edit --notes"
+[ "$($BL notes "$eid" | grep -c 'replaced line')" = 2 ] || fail "notes not replaced as rows"
+$BL notes "$eid" | grep -q "first note" && fail "old note survived the replace"
+if $BL edit "$eid" 2>/dev/null; then fail "edit with no fields should refuse"; fi
+$BL edit "$eid" --move beta | grep -q "project → beta" || fail "move"
+cd "$T/beta"; $BL list | grep -q "typo in title, fixed" || fail "card not in beta after move"
+cd "$T/alpha"; $BL list | grep -q "typo in title, fixed" && fail "card still in alpha after move"
+$BL edit "$eid" --title "" 2>/dev/null && fail "empty title accepted"
+ok "edit / retitle / move"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"
