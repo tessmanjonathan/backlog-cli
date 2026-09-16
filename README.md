@@ -63,13 +63,14 @@ its own `./backlog.db` and is not registered keeps using that file, with a hint 
 
 ```bash
 bl init
-bl create "Diagnose flaky auth" --label auth --priority 8200
+bl create "Diagnose flaky auth" --label auth,bug --priority 8200
 bl create "Add dark mode" --label ui --priority 4500
 bl list
 bl next
-bl status 1 ready
-bl note 1 "Found race on token refresh"
-bl status 1 done --outcome "Fixed with mutex"
+bl next --claim --by me
+bl note 1 "Found race on token refresh" -k finding --by me
+bl status 1 done --outcome "Fixed with mutex" --by me
+bl history 1
 bl decay --amount 25   # run daily / on schedule
 ```
 
@@ -93,16 +94,16 @@ bl decay --amount 25   # run daily / on schedule
 | `bl history <id> [--json]` | Every change the card went through: status, claim, priority, title, ... (works after delete) |
 | `bl link <id> [--blocks ID] [--child-of ID] [--related ID]` · `bl unlink` (same flags) · `bl block <id> --on ID` | Relate cards; a card with an open blocker is skipped by `bl next` and says `blocked by` wherever it is printed |
 | `bl list [-l tag[,tag]] [-s new,ready] [-n N] [--json]` | List ordered by priority; `-l` matches a card carrying any of the tags, `-n`/`--limit` caps the count (a numeric `-l` that matches nothing gets a warning) |
-| `bl next [-l label] [--ready-only] [--json]` | Highest priority actionable card |
+| `bl next [-l tag] [--ready-only] [--claim --by who] [--json]` | Highest priority actionable card: not done, not claimed, not blocked, not waiting on another card |
 | `bl show <id> [--json]` | One card |
-| `bl search <words...> [-l label] [--open] [-n 30] [--json]` | Find cards by any word in them |
+| `bl search <words...> [-l tag] [--open] [-n 30] [--json]` | Find cards by any word in them |
 | `bl note <id> "text" [-k kind] [--by who] [--commit [REV]] [--unique]` · `bl note <id> --stdin` · `bl note <id> -f FILE` | Add a note; `--stdin` / `-f` take the body without shell quoting |
 | `bl notes <id> [-k kind] [--json]` | Read a card's notes, each with its note id |
 | `bl note edit <note-id> ["text"] [-k kind]` · `bl note rm <note-id>` | Fix or remove one note by id; the card's notes mirror and the event log follow |
 | `bl heartbeat <id> --by <agent-id>` | Keep a long claim alive |
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl decay [-a 25]` | Subtract priority from all non-done cards |
-| `bl board [-l label] [-d 8] [--watch]` | Draw the board in the terminal |
+| `bl board [-l tag] [-d 8] [--watch]` | Draw the board in the terminal |
 | `bl export [-o view/index.html] [--open] [--auto]` | Standalone HTML snapshot, no server |
 | `bl auto on\|off\|status [-o view/index.html]` | Keep a snapshot in sync after every write |
 | `bl prompt [-o FILE] [--append]` | Print agent instructions for *this* backlog |
@@ -158,11 +159,32 @@ bl note 12 "retrying the build" --unique     # no-op if that note is already the
 bl notes 12 --kind blocker
 ```
 
+`bl notes` prints each note's id; `bl note edit <note-id> "text" [-k kind]` rewrites one and
+`bl note rm <note-id>` removes it, both keeping the card's mirror and the event log in step.
+`bl note <id> --stdin` and `-f FILE` take the body without shell quoting.
+
 Kinds are free-form. `cards.notes` is still maintained as a rendered mirror of the rows,
 so a `bl` built before this table — a pinned copy on another machine, an agent that never
 upgraded — keeps reading and writing the same database. When such a build appends
 straight to the blob, the next command adopts those lines back into the table, kind and
 commit sha included. Nothing has to be migrated in lockstep with the binary.
+
+## History, dependencies and bulk changes
+
+Every status, claim, release, priority, title, tag, outcome, move, link and note edit
+writes a row to an `events` table; `bl history <id>` replays them, `--json` for machines,
+and the card rail in the HTML board shows the same timeline. `bl delete <id> --why "..."`
+removes a card but leaves a `deleted` event carrying its title and every note, so the
+history still answers. Pass `--by who` to any writing verb so the row says who.
+
+```bash
+bl block 14 --on 12                         # 14 waits for 12; bl next skips 14 until 12 is done
+bl link 12 --child-of 3 --related 9         # epics and cross-references
+bl status 14 blocked --on jonathan          # parked on a person: skipped by next and reap
+bl status 14 ready                          # back in play
+bl edit --where label=art --where status=new --set priority=100 --dry-run
+bl edit --ids 12,14,15 --add-tag sprint-3 --by planner
+```
 
 ## Search
 
@@ -204,8 +226,8 @@ done
 ## Teaching an agent
 
 `bl prompt` prints the instructions below, already filled in with this backlog's absolute
-path, whether the board is self-refreshing, and the labels currently in use — so an agent
-doesn't have to guess at any of it:
+path, the project this directory resolves to, whether the board is self-refreshing, and the
+tags currently in use — so an agent doesn't have to guess at any of it:
 
 ```bash
 bl prompt                                   # read it
@@ -213,7 +235,7 @@ bl prompt -o .claude/skills/bl/SKILL.md     # install as a skill
 bl prompt -o CLAUDE.md --append             # or paste it into the project's context
 ```
 
-Re-run it when the label set changes; it is generated, not hand-maintained.
+Re-run it when the tag set changes; it is generated, not hand-maintained.
 
 ## Linking commits
 
@@ -232,15 +254,16 @@ warning that nothing was linked.
 
 ## Board view
 
-The same board — summary tiles, open cards by label, priority distribution, and the
-`new / ready / in_progress / done` columns — in three deliveries.
+The same board — summary tiles, open cards by tag, priority distribution, and the
+`new / ready / in_progress / done` columns (plus `blocked` while any card is parked) — in
+three deliveries.
 
 **Terminal.** No browser, no server:
 
 ```bash
 bl board                    # draw it once
 bl board --watch            # redraw every 5s (--watch 2 for faster)
-bl board -l worldgen -d 20  # one label, more done cards
+bl board -l worldgen -d 20  # one tag, more done cards
 ```
 
 Sizes itself to the terminal; honors `NO_COLOR` and pipes cleanly to a file.
@@ -261,8 +284,9 @@ bl --db ~/git/foo/backlog.db serve \
    --also ~/git/bar/backlog.db --port 9000        # switch between projects in the UI
 ```
 
-In both HTML views, click a card for notes, outcome, claim and timestamps; `#card-12` in
-the URL deep-links to one card.
+In both HTML views, click a card for its notes, outcome, claim, links and timeline;
+`#card-12` in the URL deep-links to one card, and a card waiting on another wears a
+`waits on #N` chip.
 
 Read-only by design: databases are opened `SQLITE_OPEN_READ_ONLY`, only the paths given on
 the command line are reachable, and the server binds `127.0.0.1` only. Use the CLI to make
@@ -271,12 +295,16 @@ changes.
 ## Suggested agent flow
 
 ```
-new  →  diagnose sub-agent  →  ready  →  implement/repair sub-agent  →  done
+plan:   bl import --stdin  →  bl block / bl link --child-of      (file and order the work)
+work:   bl next --claim --by <me>  →  bl note ... --by <me>  →  bl status done --outcome ... --by <me>
+stuck:  bl status <id> blocked --on <who or #card>   (never a note in claimed_by)
+audit:  bl history <id>, bl notes <id>
 ```
 
-Planner always starts with `bl next` (or `bl list --status ready`).
-After a cycle, optionally `bl decay`.
-Put the binary on PATH and hand Claude the instructions with `bl prompt`.
+An orchestrator files the cards in one `bl import --stdin` call, orders them with `bl block`
+and `bl link --child-of`, then lets agents self-pull with `bl next --claim` until it exits 2.
+A blocked card comes back on its own when its blocker is done. After a cycle, optionally
+`bl decay`. Put the binary on PATH and hand Claude the instructions with `bl prompt`.
 
 
 # Agent instructions

@@ -268,7 +268,7 @@ $BL show "$gid" | grep -q "  in_progress\|  new " || fail "refused status still 
 $BL status "$gid" done --outcome "$longer" --force | grep -q "done" || fail "status --force"
 if $BL edit "$gid" --outcome "$longer" 2>/dev/null; then fail "edit long outcome accepted"; fi
 if printf '{"title":"%s"}' "$long" | $BL import --stdin >/dev/null 2>&1; then fail "stdin long title accepted"; fi
-$BL prompt | grep -q "over 120 characters" || fail "prompt does not state the limit"
+$BL prompt | grep -q "120 characters" || fail "prompt does not state the limit"
 ok "title / outcome guards"
 
 # 22. note body from stdin or a file: quotes, $ and * arrive untouched
@@ -402,6 +402,18 @@ $BL list -l 5 2>&1 >/dev/null | grep -q "no card carries the tag '5'; to cap the
 $BL list -l art 2>&1 >/dev/null | grep -q "to cap the count" && fail "warned for a word tag"
 $BL next -l 7 2>&1 >/dev/null | grep -q "use -n 7" || fail "next lacks the warning"
 ok "-n limit / numeric -l warning"
+
+# 28. bl prompt carries the current rules with the project filled in
+cd "$T/alpha"
+pr=$($BL prompt)
+echo "$pr" | grep -q "This repository is project \*\*alpha\*\*" || fail "prompt lacks the project name"
+for want in "blocked --on" "bl delete" "--stdin" "120 characters" "bl history" "bl block" "--add-tag" "bl note edit" "bl edit --where"; do
+  echo "$pr" | grep -q -- "$want" || fail "prompt lacks '$want'"
+done
+echo "$pr" | grep -q "BL_AGENT" && fail "prompt describes BL_AGENT, which does not exist yet"
+echo "$pr" | grep -q "Tags in use" || fail "prompt lacks the tag list"
+grep -q "bl status 14 blocked --on jonathan" "$SRC/README.md" || fail "README lacks the blocked example"
+ok "bl prompt is current"
 
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"
