@@ -270,5 +270,18 @@ if printf '{"title":"%s"}' "$long" | $BL import --stdin >/dev/null 2>&1; then fa
 $BL prompt | grep -q "over 120 characters" || fail "prompt does not state the limit"
 ok "title / outcome guards"
 
+# 22. note body from stdin or a file: quotes, $ and * arrive untouched
+cd "$T/alpha"
+sid=$($BL create "stdin notes" | grep -o '#[0-9]*' | tr -d '#')
+printf "it's the \"\$PATH\" glob (*) case\nsecond line" | $BL note "$sid" --stdin -k finding --by piper | grep -q "note added" || fail "note --stdin"
+$BL notes "$sid" | grep -q 'it'"'"'s the "$PATH" glob (\*) case' || fail "stdin body mangled: $($BL notes "$sid")"
+$BL notes "$sid" | grep -q "^    second line" || fail "stdin second line lost"
+printf 'from a file\n' > "$T/note.txt"
+$BL note "$sid" -f "$T/note.txt" | grep -q "note added" || fail "note -f"
+$BL notes "$sid" | grep -q "from a file" || fail "file body missing"
+if printf '' | $BL note "$sid" --stdin 2>/dev/null; then fail "empty stdin note accepted"; fi
+if $BL note "$sid" "text" --stdin 2>/dev/null; then fail "text and --stdin together should be refused"; fi
+ok "note --stdin / -f"
+
 echo "all $pass checks passed  ($T)"
 rm -rf "$T"

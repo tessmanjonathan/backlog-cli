@@ -375,8 +375,15 @@ enum Commands {
         action: Option<NoteAction>,
         #[arg(required = true)]
         id: Option<i64>,
-        #[arg(required = true)]
+        /// The note; or read it with --stdin / -f so quotes and globs never touch the shell
+        #[arg(required_unless_present_any = ["stdin", "file"], conflicts_with_all = ["stdin", "file"])]
         text: Option<String>,
+        /// Read the note body from standard input
+        #[arg(long)]
+        stdin: bool,
+        /// Read the note body from a file
+        #[arg(short = 'f', long = "file", value_name = "PATH", conflicts_with = "stdin")]
+        file: Option<PathBuf>,
         /// What kind of note: note, finding, decision, blocker, attempt, …
         #[arg(short, long, default_value = "note")]
         kind: String,
@@ -2565,15 +2572,27 @@ fn main() -> Result<()> {
             action: None,
             id,
             text,
+            stdin,
+            file,
             kind,
             by,
             commit,
             unique,
         } => {
-            let (id, text) = match (id, text) {
-                (Some(i), Some(t)) => (i, t),
-                _ => bail!("usage: bl note <card-id> \"text\" (or bl note edit|rm <note-id>)"),
+            let id = id.ok_or_else(|| anyhow::anyhow!("usage: bl note <card-id> \"text\" (or bl note edit|rm <note-id>)"))?;
+            let text = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("failed to read stdin")?;
+                buf
+            } else if let Some(path) = &file {
+                std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+            } else {
+                text.unwrap_or_default()
             };
+            let text = text.trim_end().to_string();
+            if text.trim().is_empty() {
+                bail!("the note is empty");
+            }
             let now = now_str();
             let old_commits: String = conn
                 .query_row("SELECT commits FROM cards WHERE id = ?", params![id], |r| {

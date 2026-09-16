@@ -56,6 +56,9 @@ bl note 12 "auth races on token refresh" --kind finding --by "$AGENT"
 bl note 12 "chose a mutex over a channel" --kind decision
 bl note 12 "waiting on #14" --kind blocker
 bl note 12 "retrying the build" --unique      # skipped if already noted
+bl note 12 --stdin <<'EOF'                    # long or quote-heavy text: no shell escaping
+it's the "$PATH" glob (*) case
+EOF
 bl notes 12 [--kind blocker] [--json]
 ```
 
@@ -75,7 +78,7 @@ long one — the next agent can filter them.
 | `bl create "title" [--label X] [--priority 0-10000] [--notes "..."] [--if-absent]` | New card (status `new`) |
 | `bl import --stdin [--if-absent] [--by <id>]` | File many cards in one call: pipe a JSON array or one `{"title", "label"?, "priority"?, "notes"?}` per line; ids come back as JSON |
 | `bl search <words...> [--label X] [--open] [--json]` | Find cards by any word in them |
-| `bl note <id> "text" [--kind K] [--by <id>] [--commit [REV]] [--unique]` | Add a note |
+| `bl note <id> "text" [--kind K] [--by <id>] [--commit [REV]] [--unique]` | Add a note; `--stdin` or `-f FILE` instead of the text when it has quotes, `$` or `*` |
 | `bl notes <id> [--kind K] [--json]` | Read a card's notes (each line ends with its note id) |
 | `bl note edit <note-id> "text" [--kind K]` · `bl note rm <note-id>` | Fix or drop one note you got wrong |
 | `bl heartbeat <id> --by <agent-id>` | Keep a long claim alive |
