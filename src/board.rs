@@ -8,10 +8,11 @@ use anyhow::Result;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-const COLUMNS: [(&str, &str); 4] = [
+const COLUMNS: [(&str, &str); 5] = [
     ("new", "NEW"),
     ("ready", "READY"),
     ("in_progress", "IN PROGRESS"),
+    ("blocked", "BLOCKED"),
     ("done", "DONE"),
 ];
 
@@ -21,19 +22,29 @@ pub struct Opts {
     pub width: Option<usize>,
     pub watch: Option<u64>,
     pub color: bool,
+    /// Name the project on each card, for a board spanning several.
+    pub show_project: bool,
 }
 
-pub fn run(path: &Path, opts: &Opts) -> Result<()> {
+/// `title` names what the board shows: the project, or the database when it
+/// spans every project.
+pub fn run(
+    path: &Path,
+    project: Option<i64>,
+    active_only: bool,
+    title: &str,
+    opts: &Opts,
+) -> Result<()> {
     match opts.watch {
         None => {
-            let cards = crate::view::read_cards(path)?;
-            print!("{}", render(path, &cards, opts));
+            let cards = crate::view::read_cards(path, project, active_only)?;
+            print!("{}", render(title, &cards, opts));
             std::io::stdout().flush()?;
         }
         Some(secs) => loop {
-            let cards = crate::view::read_cards(path)?;
+            let cards = crate::view::read_cards(path, project, active_only)?;
             // Home the cursor and clear, so the board redraws in place.
-            print!("\x1b[H\x1b[2J{}", render(path, &cards, opts));
+            print!("\x1b[H\x1b[2J{}", render(title, &cards, opts));
             std::io::stdout().flush()?;
             std::thread::sleep(std::time::Duration::from_secs(secs.max(1)));
         },
@@ -88,6 +99,7 @@ fn status_color(status: &str) -> (u8, u8, u8) {
         "new" => (147, 164, 181),
         "ready" => (79, 191, 169),
         "in_progress" => (220, 165, 63),
+        "blocked" => (200, 96, 96),
         _ => (108, 123, 116),
     }
 }
@@ -178,7 +190,7 @@ fn term_width() -> usize {
 
 // ---------------------------------------------------------------- render
 
-pub fn render(path: &Path, all: &[Card], opts: &Opts) -> String {
+pub fn render(title: &str, all: &[Card], opts: &Opts) -> String {
     let p = Paint {
         on: opts.color && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     };
@@ -187,13 +199,17 @@ pub fn render(path: &Path, all: &[Card], opts: &Opts) -> String {
     let cards: Vec<&Card> = all
         .iter()
         .filter(|c| match &opts.label {
-            Some(l) => &c.label == l,
+            Some(l) => {
+                let want = crate::tags_of(l);
+                let have = crate::tags_of(&c.label);
+                want.iter().any(|t| have.contains(t))
+            }
             None => true,
         })
         .collect();
 
     let mut s = String::new();
-    s.push_str(&header(path, &cards, &p, total_w, opts));
+    s.push_str(&header(title, &cards, &p, total_w, opts));
     s.push('\n');
     s.push_str(&panels(&cards, &p, total_w));
     s.push('\n');
@@ -201,7 +217,7 @@ pub fn render(path: &Path, all: &[Card], opts: &Opts) -> String {
     s
 }
 
-fn header(path: &Path, cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> String {
+fn header(title: &str, cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> String {
     let open: Vec<&&Card> = cards.iter().filter(|c| c.status != "done").collect();
     let prog = cards.iter().filter(|c| c.status == "in_progress").count();
     let done = cards.iter().filter(|c| c.status == "done").count();
@@ -216,11 +232,10 @@ fn header(path: &Path, cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> Str
         open.iter().map(|c| c.priority as i64).sum::<i64>() / open.len() as i64
     };
 
-    let title = p.bold("bl/board");
     let mut s = format!(
         "{}  {}\n",
-        title,
-        p.dim(&truncate(&path.display().to_string(), w.saturating_sub(12)))
+        p.bold("bl/board"),
+        p.dim(&truncate(title, w.saturating_sub(12)))
     );
 
     let stats = format!(
@@ -249,15 +264,19 @@ fn header(path: &Path, cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> Str
 fn panels(cards: &[&Card], p: &Paint, w: usize) -> String {
     let open: Vec<&&Card> = cards.iter().filter(|c| c.status != "done").collect();
 
-    // Open cards by label
-    let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+    // Open cards by tag (a card with several counts under each)
+    let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
     for c in &open {
-        *counts
-            .entry(if c.label.is_empty() { "(none)" } else { &c.label })
-            .or_default() += 1;
+        let tags = crate::tags_of(&c.label);
+        if tags.is_empty() {
+            *counts.entry("(none)".to_string()).or_default() += 1;
+        }
+        for t in tags {
+            *counts.entry(t).or_default() += 1;
+        }
     }
-    let mut rows: Vec<(&str, usize)> = counts.into_iter().collect();
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut rows: Vec<(String, usize)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     rows.truncate(6);
     let max = rows.first().map(|r| r.1).unwrap_or(1).max(1);
 
@@ -265,7 +284,7 @@ fn panels(cards: &[&Card], p: &Paint, w: usize) -> String {
     let bar_w = w.saturating_sub(name_w + 8).min(40);
 
     let mut s = String::new();
-    s.push_str(&p.dim("OPEN BY LABEL"));
+    s.push_str(&p.dim("OPEN BY TAG"));
     s.push('\n');
     if rows.is_empty() {
         s.push_str(&p.dim("  nothing open\n"));
@@ -310,13 +329,20 @@ fn panels(cards: &[&Card], p: &Paint, w: usize) -> String {
 }
 
 fn board(cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> String {
+    // The blocked column only takes room when something is parked there.
+    let any_blocked = cards.iter().any(|c| c.status == "blocked");
+    let shown: Vec<(&str, &str)> = COLUMNS
+        .iter()
+        .copied()
+        .filter(|(k, _)| *k != "blocked" || any_blocked)
+        .collect();
     let gutter = 2usize;
-    let col_w = (w.saturating_sub(gutter * 3)) / 4;
+    let col_w = (w.saturating_sub(gutter * (shown.len() - 1))) / shown.len();
     let col_w = col_w.max(16);
 
     // Build each column's lines, then print them side by side.
     let mut columns: Vec<Vec<String>> = Vec::new();
-    for (key, name) in COLUMNS {
+    for (key, name) in shown {
         let mut items: Vec<&&Card> = cards.iter().filter(|c| c.status == key).collect();
         let total = items.len();
         if key == "done" {
@@ -342,10 +368,15 @@ fn board(cards: &[&Card], p: &Paint, w: usize, opts: &Opts) -> String {
             let pri = p.rgb(&format!("{:>5}", c.priority), heat(c.priority));
             let id_plain = format!("#{}", c.id);
             let label_room = col_w.saturating_sub(width_of(&id_plain) + 6 + 2);
-            let label = if c.label.is_empty() {
+            let tag = match (opts.show_project && !c.project.is_empty(), c.label.is_empty()) {
+                (true, true) => c.project.clone(),
+                (true, false) => format!("{}/{}", c.project, c.label),
+                (false, _) => c.label.clone(),
+            };
+            let label = if tag.is_empty() {
                 " ".repeat(label_room)
             } else {
-                p.dim(&pad(&truncate(&c.label, label_room), label_room))
+                p.dim(&pad(&truncate(&tag, label_room), label_room))
             };
             lines.push(format!("{id} {label} {pri}"));
 

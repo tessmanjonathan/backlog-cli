@@ -6,7 +6,7 @@
 
 use crate::Card;
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -21,12 +21,28 @@ const BOOTSTRAP_SLOT: &str = r#"<script id="bldata" type="application/json">null
 pub struct Source {
     pub label: String,
     pub path: PathBuf,
+    /// Only this project's cards; None means every project the source shows.
+    pub project: Option<i64>,
+    /// With no project filter, hide inactive projects (the central store's
+    /// default); false shows a database whole, as an `--also` file is.
+    pub active_only: bool,
 }
 
 #[derive(serde::Serialize)]
 struct DbRef {
     index: usize,
     label: String,
+    path: String,
+    /// The shared store: `bl show <id>` works from any registered repository,
+    /// so the page's CLI hint needs no `--db`.
+    central: bool,
+}
+
+#[derive(serde::Serialize, Clone)]
+struct ProjectRef {
+    id: i64,
+    name: String,
+    active: bool,
     path: String,
 }
 
@@ -35,6 +51,10 @@ struct Feed {
     db: DbRef,
     databases: Vec<DbRef>,
     generated_at: String,
+    /// The one project this feed is scoped to, if any.
+    project: Option<ProjectRef>,
+    /// Every project in the database, so the page can offer a selector.
+    projects: Vec<ProjectRef>,
     cards: Vec<Card>,
 }
 
@@ -179,10 +199,12 @@ pub fn export(sources: Vec<Source>, out: &Path) -> Result<()> {
 /// Rewrite an existing snapshot from the database, silently. This is what
 /// makes the static file behave like a live view: every command that writes a
 /// card calls it, so opening (or reloading) the HTML always shows the truth.
-pub fn refresh(db: &Path, out: &Path) -> Result<()> {
+pub fn refresh(db: &Path, project: Option<i64>, active_only: bool, out: &Path) -> Result<()> {
     let source = Source {
         label: db.display().to_string(),
         path: db.to_path_buf(),
+        project,
+        active_only,
     };
     write_snapshot(&source, out)?;
     Ok(())
@@ -252,19 +274,60 @@ fn feed(sources: &[Source], idx: usize) -> Result<Feed> {
             .unwrap_or_else(|_| s.path.clone())
             .display()
             .to_string(),
+        central: s.active_only,
     };
+    let projects = read_projects(&src.path)?;
+    let project = src
+        .project
+        .and_then(|id| projects.iter().find(|p| p.id == id).cloned());
     let feed = Feed {
         db: dbref(idx, src),
         databases: sources.iter().enumerate().map(|(i, s)| dbref(i, s)).collect(),
         generated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        cards: read_cards(&src.path)?,
+        project,
+        projects,
+        cards: read_cards(&src.path, src.project, src.active_only)?,
     };
     Ok(feed)
 }
 
-/// Reads every card, highest priority first. Opened read-only: the board and
-/// the snapshot never write to a backlog.
-pub fn read_cards(path: &Path) -> Result<Vec<Card>> {
+/// The projects table, read-only; empty for a database that predates it.
+fn read_projects(path: &Path) -> Result<Vec<ProjectRef>> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("failed to open {}", path.display()))?;
+    let has: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !has {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare("SELECT id, name, active, path FROM projects ORDER BY name")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ProjectRef {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            active: r.get::<_, i64>(2)? != 0,
+            path: r.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Reads every card in scope, highest priority first. Opened read-only: the
+/// board and the snapshot never write to a backlog.
+pub fn read_cards(path: &Path, project: Option<i64>, active_only: bool) -> Result<Vec<Card>> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -272,29 +335,64 @@ pub fn read_cards(path: &Path) -> Result<Vec<Card>> {
     .with_context(|| format!("failed to open {}", path.display()))?;
 
     // A database reached through --also is opened read-only and may predate a
-    // column this build knows about; substitute empties rather than failing.
+    // column or table this build knows about; substitute empties rather than
+    // failing.
     let present: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(cards)")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
         rows.filter_map(|r| r.ok()).collect()
     };
-    let cols: Vec<String> = crate::SELECT_COLS
+    let has_projects: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let mut cols: Vec<String> = crate::CARD_COLS
         .split(", ")
         .map(|c| {
             if present.iter().any(|p| p == c) {
                 c.to_string()
+            } else if c == "project_id" {
+                format!("0 AS {c}")
             } else {
                 format!("'' AS {c}")
             }
         })
         .collect();
+    cols.push(if has_projects {
+        crate::PROJECT_COL.to_string()
+    } else {
+        "'' AS project".to_string()
+    });
+    for c in crate::TRAILING_COLS.split(", ") {
+        cols.push(if present.iter().any(|p| p == c) {
+            c.to_string()
+        } else {
+            format!("NULL AS {c}")
+        });
+    }
 
-    let sql = format!(
-        "SELECT {} FROM cards ORDER BY priority DESC, created_at ASC",
-        cols.join(", ")
-    );
+    let mut sql = format!("SELECT {} FROM cards WHERE 1=1", cols.join(", "));
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if has_projects && present.iter().any(|p| p == "project_id") {
+        match project {
+            Some(id) => {
+                sql.push_str(" AND project_id = ?");
+                binds.push(Box::new(id));
+            }
+            None if active_only => {
+                sql.push_str(" AND project_id IN (SELECT id FROM projects WHERE active = 1)");
+            }
+            None => {}
+        }
+    }
+    sql.push_str(" ORDER BY priority DESC, created_at ASC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], crate::row_to_card)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), crate::row_to_card)?;
 
     let mut out = Vec::new();
     for r in rows {

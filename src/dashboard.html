@@ -30,6 +30,8 @@
     --s-prog-bg:  #F3E6CB;
     --s-done:     #7C8A83;
     --s-done-bg:  #E6EBE8;
+    --s-block:    #A6403A;
+    --s-block-bg: #F1DEDC;
 
     /* Priority heat ramp */
     --heat-cold: #7C93A0;
@@ -62,6 +64,8 @@
       --s-prog-bg:  #322610;
       --s-done:     #6C7B74;
       --s-done-bg:  #1B2320;
+      --s-block:    #D9736C;
+      --s-block-bg: #2E1F1E;
 
       --heat-cold: #61818F;
       --heat-hot:  #E06A4E;
@@ -89,6 +93,8 @@
     --s-prog-bg:  #322610;
     --s-done:     #6C7B74;
     --s-done-bg:  #1B2320;
+    --s-block:    #D9736C;
+    --s-block-bg: #2E1F1E;
 
     --heat-cold: #61818F;
     --heat-hot:  #E06A4E;
@@ -286,7 +292,7 @@
 
   .board {
     display: grid;
-    grid-template-columns: repeat(4, minmax(215px, 1fr));
+    grid-template-columns: repeat(var(--cols, 4), minmax(215px, 1fr));
     gap: 14px;
     align-items: start;
   }
@@ -375,6 +381,13 @@
     color: var(--ink-2);
     border: 1px solid var(--line-soft);
   }
+  .chip.project {
+    background: var(--accent-soft);
+    color: var(--accent);
+    border-color: transparent;
+  }
+  .bar-row.pick { cursor: pointer; }
+  .bar-row.pick:hover .name { color: var(--accent); }
   .chip.agent {
     background: var(--s-prog-bg);
     color: var(--s-prog);
@@ -461,9 +474,10 @@
 <header>
   <div class="wordmark">bl<span>/</span>board</div>
   <select id="dbpick" aria-label="Database"></select>
+  <select id="projectpick" aria-label="Project" hidden></select>
   <div class="dbpath" id="dbpath" title=""></div>
   <div class="spacer"></div>
-  <label class="label" for="labelpick">label</label>
+  <label class="label" for="labelpick">tag</label>
   <select id="labelpick" aria-label="Filter by label"><option value="">all</option></select>
   <label class="label" for="donepick">done</label>
   <select id="donepick" aria-label="Done cards shown">
@@ -482,8 +496,12 @@
   <section class="strip" id="strip" aria-label="Summary"></section>
 
   <div class="panels">
+    <section class="panel" id="projectpanel" hidden>
+      <h2 class="label">Open cards by project</h2>
+      <div class="bars" id="projectbars"></div>
+    </section>
     <section class="panel">
-      <h2 class="label">Open cards by label</h2>
+      <h2 class="label">Open cards by tag</h2>
       <div class="bars" id="labelbars"></div>
     </section>
     <section class="panel">
@@ -520,11 +538,19 @@
     { key: "new",         name: "New",         color: "var(--s-new)" },
     { key: "ready",       name: "Ready",       color: "var(--s-ready)" },
     { key: "in_progress", name: "In progress", color: "var(--s-prog)" },
+    { key: "blocked",     name: "Blocked",     color: "var(--s-block)", optional: true },
     { key: "done",        name: "Done",        color: "var(--s-done)" },
   ];
 
   const $ = (id) => document.getElementById(id);
-  const state = { cards: [], db: 0, label: "", doneLimit: 20, selected: null };
+  const state = { cards: [], db: 0, label: "", doneLimit: 20, selected: null,
+                  project: "", projects: [], scoped: null };
+
+  // The project filter lives in the query string so a link keeps it, and in
+  // localStorage so the page reopens where it was left.
+  const params = new URLSearchParams(location.search);
+  if (params.has("project")) state.project = params.get("project");
+  else { try { state.project = localStorage.getItem("bl.project") || ""; } catch (e) {} }
 
   // --- helpers -------------------------------------------------------------
 
@@ -559,11 +585,22 @@
     return `color-mix(in oklab, var(--heat-hot) ${Math.round(t * 100)}%, var(--heat-cold))`;
   };
 
+  // Cards of the chosen project (or all), before the label filter.
+  const inProject = () =>
+    state.project ? state.cards.filter((c) => c.project === state.project) : state.cards;
+
+  // A label is a comma-separated tag list; the filter matches any one tag.
+  const tagsOf = (label) => String(label || "").split(",").map((t) => t.trim()).filter(Boolean);
+
   const visible = () => {
-    let cards = state.cards;
-    if (state.label) cards = cards.filter((c) => c.label === state.label);
+    let cards = inProject();
+    if (state.label) cards = cards.filter((c) => tagsOf(c.label).includes(state.label));
     return cards;
   };
+
+  // More than one project on screen: name it on every card.
+  const spanning = () => !state.project && !state.scoped &&
+    new Set(state.cards.map((c) => c.project).filter(Boolean)).size > 1;
 
   // --- rendering -----------------------------------------------------------
 
@@ -587,7 +624,8 @@
     }, Date.now());
 
     const tiles = [
-      ["Open", open.length, `${cards.filter((c) => c.status === "new").length} new · ${cards.filter((c) => c.status === "ready").length} ready`],
+      ["Open", open.length, `${cards.filter((c) => c.status === "new").length} new · ${cards.filter((c) => c.status === "ready").length} ready${
+        cards.some((c) => c.status === "blocked") ? ` · ${cards.filter((c) => c.status === "blocked").length} blocked` : ""}`],
       ["In progress", prog.length, agents.size ? `${agents.size} agent${agents.size > 1 ? "s" : ""} holding` : "unclaimed"],
       ["Avg priority", avg, open.length ? "across open cards" : "nothing open"],
       ["Top card", top ? "#" + top.id : "—", top ? `priority ${top.priority}` : "board clear"],
@@ -603,12 +641,31 @@
       </div>`).join("");
   }
 
+  function renderProjectBars() {
+    const panel = $("projectpanel");
+    const names = [...new Set(state.cards.map((c) => c.project).filter(Boolean))];
+    if (state.scoped || names.length < 2) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const open = state.cards.filter((c) => c.status !== "done");
+    const counts = new Map(names.map((n) => [n, 0]));
+    for (const c of open) if (c.project) counts.set(c.project, counts.get(c.project) + 1);
+    const rows = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const max = Math.max(1, ...rows.map((r) => r[1]));
+    $("projectbars").innerHTML = rows.map(([name, n]) => `
+      <div class="bar-row pick" data-project="${esc(name)}" title="Show only ${esc(name)}"
+           style="${state.project === name ? "font-weight:600" : ""}">
+        <div class="name">${esc(name)}</div>
+        <div class="track"><div style="width:${(n / max) * 100}%;background:var(--accent)"></div></div>
+        <div class="n">${n}</div>
+      </div>`).join("");
+  }
+
   function renderLabelBars(cards) {
     const open = cards.filter((c) => c.status !== "done");
     const counts = new Map();
     for (const c of open) {
-      const k = c.label || "(none)";
-      counts.set(k, (counts.get(k) || 0) + 1);
+      const tags = tagsOf(c.label);
+      for (const k of (tags.length ? tags : ["(none)"])) counts.set(k, (counts.get(k) || 0) + 1);
     }
     const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
     const max = rows.length ? rows[0][1] : 1;
@@ -639,27 +696,38 @@
   function cardHTML(c) {
     const agentChip = c.claimed_by
       ? `<span class="chip agent">@${esc(c.claimed_by)}</span>` : "";
-    const labelChip = c.label ? `<span class="chip">${esc(c.label)}</span>` : "";
+    const labelChip = tagsOf(c.label).map((t) => `<span class="chip">${esc(t)}</span>`).join("");
+    const projectChip = spanning() && c.project
+      ? `<span class="chip project">${esc(c.project)}</span>` : "";
     const outcomeChip = c.status === "done" && c.outcome
       ? `<span class="chip done">outcome</span>` : "";
+    const blockedChip = c.status === "blocked" && c.blocked_on
+      ? `<span class="chip agent">on ${esc(c.blocked_on)}</span>` : "";
+    const openBlockers = (c.links || []).filter((l) => l.rel === "blocked_by" && l.status !== "done");
+    const waitChip = openBlockers.length
+      ? `<span class="chip agent" title="${esc(openBlockers.map((l) => "#" + l.id + " " + l.title).join("\n"))}">waits on ${
+          openBlockers.map((l) => "#" + l.id).join(" ")}</span>` : "";
     return `
       <button class="card" data-id="${c.id}" style="--heat:${heat(c.priority)}"
               aria-current="${state.selected === c.id}">
         <div class="top">
           <span class="id">#${c.id}</span>
-          ${labelChip}
+          ${projectChip}${labelChip}${waitChip}
           <span class="pri">${c.priority}</span>
         </div>
         <div class="title">${esc(c.title)}</div>
         <div class="meta">
-          ${agentChip}${outcomeChip}
+          ${agentChip}${blockedChip}${outcomeChip}
           <span class="ago">${esc(ago(c.updated_at))}</span>
         </div>
       </button>`;
   }
 
   function renderBoard(cards) {
-    $("board").innerHTML = COLUMNS.map((col) => {
+    // The blocked column appears only while something is parked there.
+    const cols = COLUMNS.filter((col) => !col.optional || cards.some((c) => c.status === col.key));
+    $("board").style.setProperty("--cols", cols.length);
+    $("board").innerHTML = cols.map((col) => {
       let items = cards.filter((c) => c.status === col.key);
       const total = items.length;
       if (col.key === "done") {
@@ -691,7 +759,7 @@
       scrim.hidden = true;
       return;
     }
-    const statusColor = { new: "--s-new", ready: "--s-ready", in_progress: "--s-prog", done: "--s-done" }[c.status];
+    const statusColor = { new: "--s-new", ready: "--s-ready", in_progress: "--s-prog", blocked: "--s-block", done: "--s-done" }[c.status] || "--s-new";
     rail.innerHTML = `
       <button class="close" id="railclose" aria-label="Close">✕</button>
       <div>
@@ -699,10 +767,12 @@
         <h2>${esc(c.title)}</h2>
       </div>
       <dl class="kv">
-        <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}</dd>
+        ${c.project ? `<dt>Project</dt><dd>${esc(c.project)}</dd>` : ""}
+        <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}${c.blocked_on ? ` <span style="color:var(--ink-3)">on ${esc(c.blocked_on)}</span>` : ""}</dd>
         <dt>Priority</dt><dd style="color:${heat(c.priority)}">${c.priority}</dd>
-        <dt>Label</dt><dd>${esc(c.label || "—")}</dd>
+        <dt>Tags</dt><dd>${esc(tagsOf(c.label).join(", ") || "—")}</dd>
         <dt>Claimed</dt><dd>${c.claimed_by ? esc("@" + c.claimed_by) + " · " + esc(full(c.claimed_at)) : "—"}</dd>
+        ${c.legacy_id ? `<dt>Imported</dt><dd>was #${c.legacy_id} in the repo board</dd>` : ""}
         <dt>Created</dt><dd>${esc(full(c.created_at))}</dd>
         <dt>Updated</dt><dd>${esc(full(c.updated_at))} <span style="color:var(--ink-3)">(${esc(ago(c.updated_at))})</span></dd>
       </dl>
@@ -719,19 +789,38 @@
           `<b>${esc(sha)}</b>${subject ? "  " + esc(subject) : ""}`).join("\n")
       }</pre></div>` : ""}
       ${c.outcome ? `<div class="block"><h3 class="label">Outcome</h3><pre>${esc(c.outcome)}</pre></div>` : ""}
+      ${(c.links && c.links.length) ? `<div class="block"><h3 class="label">Links</h3><pre>${
+        ["blocked_by", "blocks", "child_of", "parent_of", "related"].map((rel) => {
+          const items = c.links.filter((l) => l.rel === rel);
+          if (!items.length) return "";
+          const name = { blocked_by: "blocked by", blocks: "blocks", child_of: "child of", parent_of: "children", related: "related" }[rel];
+          return `<b>${name}</b>  ${items.map((l) =>
+            `<a href="#card-${l.id}" data-goto="${l.id}">#${l.id}</a> <span style="color:var(--ink-3)">${esc(l.status)}</span> ${esc(l.title)}`
+          ).join("\n" + " ".repeat(name.length + 2))}`;
+        }).filter(Boolean).join("\n")}</pre></div>` : ""}
+      ${(c.events && c.events.length) ? `<div class="block"><h3 class="label">Timeline</h3><pre>${
+        c.events.map((e) => {
+          const flat = (s) => { const f = String(s).replace(/\n/g, " | "); return f.length > 120 ? f.slice(0, 117) + "..." : f; };
+          const change = e.before && e.after ? `${esc(flat(e.before))} → ${esc(flat(e.after))}`
+            : e.after ? `→ ${esc(flat(e.after))}` : e.before ? `${esc(flat(e.before))} →` : "";
+          return `<span style="color:var(--ink-3)">${esc(e.at)}</span>  <b>${esc(e.kind)}</b>  ${change}${
+            e.by ? ` <span style="color:var(--ink-3)">· ${esc(e.by)}</span>` : ""}`;
+        }).join("\n")}</pre></div>` : ""}
       <div class="block">
         <h3 class="label">Inspect from the CLI</h3>
-        <pre>bl show ${c.id}${state.dbPath ? ` --db ${state.dbPath}` : ""}</pre>
+        <pre>bl show ${c.id}${state.central || !state.dbPath ? "" : ` --db ${state.dbPath}`}</pre>
       </div>`;
     rail.hidden = false;
     scrim.hidden = false;
     $("railclose").addEventListener("click", close);
+    rail.querySelectorAll("[data-goto]").forEach((a) =>
+      a.addEventListener("click", (e) => { e.preventDefault(); select(Number(a.dataset.goto)); }));
   }
 
   function select(id) {
     state.selected = id;
     // Keep the card in the URL so a board view can be linked to directly.
-    history.replaceState(null, "", id ? "#card-" + id : location.pathname);
+    history.replaceState(null, "", location.pathname + location.search + (id ? "#card-" + id : ""));
     renderRail();
     renderBoard(visible());
   }
@@ -740,6 +829,7 @@
 
   function renderAll() {
     const cards = visible();
+    renderProjectBars();
     renderStrip(cards);
     renderLabelBars(cards);
     renderHist(cards);
@@ -750,7 +840,7 @@
   // --- data ----------------------------------------------------------------
 
   function syncLabelPicker() {
-    const labels = [...new Set(state.cards.map((c) => c.label).filter(Boolean))].sort();
+    const labels = [...new Set(inProject().flatMap((c) => tagsOf(c.label)))].sort();
     const pick = $("labelpick");
     const want = ["", ...labels].join("|");
     if (pick.dataset.sig === want) return;
@@ -761,11 +851,54 @@
     state.label = pick.value;
   }
 
+  function syncProjectPicker() {
+    const pick = $("projectpick");
+    const names = [...new Set(state.cards.map((c) => c.project).filter(Boolean))].sort();
+    if (state.scoped || names.length < 2) {
+      pick.hidden = true;
+      if (state.scoped) state.project = "";
+      return;
+    }
+    pick.hidden = false;
+    const want = ["", ...names].join("|");
+    if (pick.dataset.sig !== want) {
+      pick.dataset.sig = want;
+      pick.innerHTML = `<option value="">all projects</option>` +
+        names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    }
+    if (state.project && !names.includes(state.project)) state.project = "";
+    pick.value = state.project;
+  }
+
+  function setProject(name) {
+    state.project = name;
+    try { localStorage.setItem("bl.project", name); } catch (e) {}
+    const url = new URL(location.href);
+    if (name) url.searchParams.set("project", name); else url.searchParams.delete("project");
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
+    // A card from another project stays selected only if it is still on screen.
+    const sel = state.cards.find((c) => c.id === state.selected);
+    if (sel && name && sel.project !== name) state.selected = null;
+    syncProjectPicker();
+    syncLabelPicker();
+    renderAll();
+  }
+
   function apply(data) {
     state.cards = data.cards;
     state.dbPath = data.db.path;
-    $("dbpath").innerHTML = `<bdi>${esc(data.db.path)}</bdi>`;
-    $("dbpath").title = data.db.path;
+    state.central = !!data.db.central;
+    state.projects = data.projects || [];
+    state.scoped = data.project || null;
+    const where = state.scoped ? `${state.scoped.name} · ${data.db.path}` : data.db.path;
+    $("dbpath").innerHTML = `<bdi>${esc(where)}</bdi>`;
+    $("dbpath").title = where;
+
+    // A deep link into a project that is filtered out: follow the link.
+    const linkedCard = state.cards.find((c) => c.id === state.selected);
+    if (linkedCard && state.project && linkedCard.project !== state.project) {
+      state.project = linkedCard.project || "";
+    }
 
     const pick = $("dbpick");
     const sig = data.databases.map((d) => d.label).join("|");
@@ -777,6 +910,7 @@
     pick.value = String(data.db.index);
     pick.hidden = data.databases.length < 2;
 
+    syncProjectPicker();
     syncLabelPicker();
     $("banner").hidden = true;
     renderAll();
@@ -819,6 +953,11 @@
     state.db = Number(e.target.value);
     state.selected = null;
     load();
+  });
+  $("projectpick").addEventListener("change", (e) => setProject(e.target.value));
+  document.addEventListener("click", (e) => {
+    const row = e.target.closest(".bar-row.pick");
+    if (row) setProject(state.project === row.dataset.project ? "" : row.dataset.project);
   });
   $("labelpick").addEventListener("change", (e) => {
     state.label = e.target.value;

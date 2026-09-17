@@ -1,22 +1,34 @@
 mod board;
+mod events;
+mod import;
+mod links;
 mod notes;
+mod store;
 mod view;
 
+use events::Event;
+use links::Rel;
 use notes::Note;
+use store::Project;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand, ValueEnum};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::env;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_DB: &str = "backlog.db";
+pub(crate) const DEFAULT_DB: &str = "backlog.db";
 
 /// Exit codes an agent loop can branch on without parsing output.
 /// 0 success · 1 error · 2 nothing matched · 3 someone else holds the claim.
 const EXIT_EMPTY: i32 = 2;
 const EXIT_CONTENDED: i32 = 3;
+
+/// What `ensure_schema` brings a database up to, stamped in `meta`.
+/// 1 cards · 2 claims · 3 typed notes · 4 projects and the central store ·
+/// 5 events, links, tags and the blocked status.
+const SCHEMA_VERSION: i64 = 5;
 
 /// Print anything buffered, then leave with a code the caller can test.
 fn exit_with(code: i32) -> ! {
@@ -33,7 +45,7 @@ CREATE TABLE IF NOT EXISTS cards (
     notes       TEXT NOT NULL DEFAULT '',
     label       TEXT NOT NULL DEFAULT '',
     status      TEXT NOT NULL DEFAULT 'new'
-                CHECK(status IN ('new', 'ready', 'in_progress', 'done')),
+                CHECK(status IN ('new', 'ready', 'in_progress', 'blocked', 'done')),
     priority    INTEGER NOT NULL DEFAULT 5000
                 CHECK(priority BETWEEN 0 AND 10000),
     outcome     TEXT NOT NULL DEFAULT '',
@@ -41,13 +53,28 @@ CREATE TABLE IF NOT EXISTS cards (
     claimed_at  TEXT NOT NULL DEFAULT '',
     commits     TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    project_id  INTEGER NOT NULL DEFAULT 0,
+    legacy_id   INTEGER,
+    blocked_on  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_status_priority
     ON cards(status, priority DESC, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_label ON cards(label);
 CREATE INDEX IF NOT EXISTS idx_claimed_by ON cards(claimed_by);
+
+-- One row per repository sharing this database. `path` is the main checkout;
+-- worktrees resolve to it through git. Inactive projects are skipped by
+-- `bl next` and hidden from the default views.
+CREATE TABLE IF NOT EXISTS projects (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    path        TEXT NOT NULL UNIQUE,
+    active      INTEGER NOT NULL DEFAULT 1,
+    autoexport  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- Per-backlog settings, e.g. the snapshot path kept in sync on every write.
 CREATE TABLE IF NOT EXISTS meta (
@@ -69,6 +96,37 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_card ON notes(card_id, id);
+
+-- The audit trail: one row per change to a card (status, claim, priority,
+-- title...). Never updated or deleted, and not cascaded: a deleted card's
+-- history stays readable. `before`/`after`/`by` are keywords, hence the names.
+CREATE TABLE IF NOT EXISTS events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id     INTEGER NOT NULL,
+    project_id  INTEGER NOT NULL DEFAULT 0,
+    kind        TEXT NOT NULL,
+    old_value   TEXT NOT NULL DEFAULT '',
+    new_value   TEXT NOT NULL DEFAULT '',
+    actor       TEXT NOT NULL DEFAULT '',
+    at          TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_card ON events(card_id, id);
+
+-- Relations between cards. `from blocks to` keeps `to` out of bl next until
+-- `from` is done; `from child_of to` groups work under an epic; `related` is
+-- a cross-reference stored once, lowest id first.
+CREATE TABLE IF NOT EXISTS links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_id     INTEGER NOT NULL,
+    kind        TEXT NOT NULL CHECK(kind IN ('blocks', 'child_of', 'related')),
+    to_id       INTEGER NOT NULL,
+    actor       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(from_id, kind, to_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_links_to ON links(to_id, kind);
 "#;
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -77,6 +135,8 @@ enum Status {
     Ready,
     #[value(name = "in_progress")]
     InProgress,
+    /// Parked on someone or something: skipped by next and reap until moved on
+    Blocked,
     Done,
 }
 
@@ -86,8 +146,14 @@ impl Status {
             Status::New => "new",
             Status::Ready => "ready",
             Status::InProgress => "in_progress",
+            Status::Blocked => "blocked",
             Status::Done => "done",
         }
+    }
+
+    /// Everything but in_progress drops the claim.
+    fn clears_claim(&self) -> bool {
+        !matches!(self, Status::InProgress)
     }
 }
 
@@ -98,20 +164,77 @@ impl std::fmt::Display for Status {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "bl", about = "Lightweight Kanban backlog for Claude Code agents")]
+#[command(
+    name = "bl",
+    about = "Lightweight Kanban backlog for Claude Code agents",
+    disable_version_flag = true,
+    arg_required_else_help = true
+)]
 struct Cli {
-    /// Path to the SQLite database (default: ./backlog.db or $BL_DB)
+    /// Print the bl version and the schema version of the database it would open
+    #[arg(short = 'V', long, global = true)]
+    version: bool,
+
+    /// Use this database instead of the central store (also $BL_DB)
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
+    /// Scope to one project by name or #id (also $BL_PROJECT). Defaults to
+    /// the project whose repository the current directory is in.
+    #[arg(short = 'P', long, global = true, value_name = "NAME")]
+    project: Option<String>,
+
+    /// Read across every active project instead of the current one
+    #[arg(long, global = true)]
+    all: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Create the database and schema (safe to re-run; migrates old DBs)
+    /// Create the central store (or --db file) and register this repository
     Init,
+
+    /// Register, list, activate, deactivate or remove projects
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
+
+    /// Copy a repo-level backlog.db into the store, or file many cards from stdin
+    Import {
+        /// The backlog.db to read (or use --stdin)
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        source: Option<PathBuf>,
+        /// Read cards from stdin: a JSON array or one JSON object per line
+        /// ({"title", "label"?, "priority"?, "notes"?, "project"?}); prints the new ids as JSON
+        #[arg(long)]
+        stdin: bool,
+        /// With --stdin: a card whose exact title already exists is reported, not filed again
+        #[arg(long, requires = "stdin")]
+        if_absent: bool,
+        /// With --stdin: who is filing them, for notes and the event log
+        #[arg(long, requires = "stdin")]
+        by: Option<String>,
+        /// Count what would happen without writing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Import every repo-level backlog.db beside a registered project or under --scan dirs
+    Migrate {
+        /// Directories whose immediate children may hold a backlog.db (e.g. ~/git)
+        #[arg(long, value_name = "DIR")]
+        scan: Vec<PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Create a new card
     Create {
@@ -125,6 +248,85 @@ enum Commands {
         /// If a card with this exact title exists, print its id and create nothing
         #[arg(long)]
         if_absent: bool,
+        /// Who is creating it, for the event log
+        #[arg(long)]
+        by: Option<String>,
+        /// Accept a title over 120 characters anyway
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Change any field of one card, or of many with --ids / --where
+    Edit {
+        /// The card; or use --ids / --where for several
+        id: Option<i64>,
+        /// Comma-separated card ids to change together
+        #[arg(long, value_name = "1,2,3", conflicts_with = "id")]
+        ids: Option<String>,
+        /// Select cards by field: label=art, status=new, priority<2000, project=NAME, claimed_by=X (repeatable, all must hold)
+        #[arg(long = "where", value_name = "FIELD=VALUE", conflicts_with_all = ["id", "ids"])]
+        r#where: Vec<String>,
+        /// Change a field by name: priority=100, label=visual, status=ready, outcome=..., project=NAME (repeatable)
+        #[arg(long = "set", value_name = "FIELD=VALUE")]
+        set: Vec<String>,
+        /// List the cards that would change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        title: Option<String>,
+        /// Replace the tags (comma-separated)
+        #[arg(long)]
+        label: Option<String>,
+        /// Add a tag, keeping the others (repeatable)
+        #[arg(long, value_name = "TAG")]
+        add_tag: Vec<String>,
+        /// Remove a tag, keeping the others (repeatable)
+        #[arg(long, value_name = "TAG")]
+        rm_tag: Vec<String>,
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Replace every note on the card with this text (one note per line)
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        outcome: Option<String>,
+        /// Moves like `bl status`: leaving in_progress clears the claim
+        #[arg(long)]
+        status: Option<Status>,
+        /// Move the card to another project (by name or #id)
+        #[arg(long, value_name = "PROJECT")]
+        r#move: Option<String>,
+        /// Who is editing, for the event log
+        #[arg(long)]
+        by: Option<String>,
+        /// Accept a title over 120 or an outcome over 300 characters anyway
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Change a card's title (short for `bl edit <id> --title`)
+    Retitle {
+        id: i64,
+        title: String,
+        /// Accept a title over 120 characters anyway
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Remove a card created in error. Its title and notes stay in `bl history`.
+    Delete {
+        id: i64,
+        /// Why it goes, kept on the deleted event
+        #[arg(long)]
+        why: Option<String>,
+        /// Delete even if an agent holds the claim
+        #[arg(long)]
+        force: bool,
+        /// Who is deleting, for the event log
+        #[arg(long)]
+        by: Option<String>,
     },
 
     /// Set priority score (0-10000)
@@ -132,6 +334,9 @@ enum Commands {
     SetPriority {
         id: i64,
         priority: i32,
+        /// Who is re-ranking, for the event log
+        #[arg(long)]
+        by: Option<String>,
     },
 
     /// Update status (and optionally outcome). Clears claim when moving to ready/done/new.
@@ -140,6 +345,62 @@ enum Commands {
         status: Status,
         #[arg(long, default_value = "")]
         outcome: String,
+        /// Who is moving it, for the event log
+        #[arg(long)]
+        by: Option<String>,
+        /// Accept an outcome over 300 characters anyway
+        #[arg(long)]
+        force: bool,
+        /// With `blocked`: who or what it waits on (a name, or #<card> to also link it)
+        #[arg(long, value_name = "WHO|#ID")]
+        on: Option<String>,
+    },
+
+    /// Relate two cards: `bl link 12 --blocks 14`, `--child-of 3`, `--related 9`
+    Link {
+        id: i64,
+        /// This card must be done before the other can be picked by bl next
+        #[arg(long, value_name = "ID")]
+        blocks: Vec<i64>,
+        /// Group this card under an epic
+        #[arg(long, value_name = "ID")]
+        child_of: Vec<i64>,
+        /// A plain cross-reference
+        #[arg(long, value_name = "ID")]
+        related: Vec<i64>,
+        /// Who is linking, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Remove a relation made with bl link (same flags)
+    Unlink {
+        id: i64,
+        #[arg(long, value_name = "ID")]
+        blocks: Vec<i64>,
+        #[arg(long, value_name = "ID")]
+        child_of: Vec<i64>,
+        #[arg(long, value_name = "ID")]
+        related: Vec<i64>,
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Park a card behind another: `bl block 14 --on 12` = `bl link 12 --blocks 14`
+    Block {
+        id: i64,
+        /// The card that has to be done first
+        #[arg(long, value_name = "ID", required = true)]
+        on: Vec<i64>,
+        #[arg(long)]
+        by: Option<String>,
+    },
+
+    /// Replay every change a card went through (works for deleted cards too)
+    History {
+        id: i64,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Atomically claim a card (ready → in_progress). Fails if already claimed.
@@ -158,15 +419,16 @@ enum Commands {
         by: Option<String>,
     },
 
-    /// List cards (filter by label / status, ordered by priority)
+    /// List cards (filter by tag / status, ordered by priority; -n caps the count)
     List {
-        #[arg(short, long)]
+        /// Only cards carrying this tag (or any of `a,b`). Not a count: that is -n
+        #[arg(short, long, value_name = "TAG")]
         label: Option<String>,
         /// Comma-separated statuses (e.g. new,ready,in_progress). Default: all non-done
         #[arg(short, long)]
         status: Option<String>,
-        /// `-l` is taken by --label, so the limit is `-n`.
-        #[arg(short = 'n', long, default_value_t = 30)]
+        /// How many cards to print
+        #[arg(short = 'n', long, default_value_t = 30, value_name = "N")]
         limit: i64,
         /// Output as JSON
         #[arg(long)]
@@ -175,7 +437,8 @@ enum Commands {
 
     /// Highest-priority actionable card. With --claim, atomically claims it.
     Next {
-        #[arg(short, long)]
+        /// Only cards carrying this tag (or any of `a,b`)
+        #[arg(short, long, value_name = "TAG")]
         label: Option<String>,
         /// Prefer only 'ready' cards (skip 'new')
         #[arg(long)]
@@ -197,10 +460,22 @@ enum Commands {
         json: bool,
     },
 
-    /// Append a note to a card, optionally typed and linked to a git commit
+    /// Append a note to a card; `bl note edit|rm <note-id>` fixes one by its id
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Note {
-        id: i64,
-        text: String,
+        #[command(subcommand)]
+        action: Option<NoteAction>,
+        #[arg(required = true)]
+        id: Option<i64>,
+        /// The note; or read it with --stdin / -f so quotes and globs never touch the shell
+        #[arg(required_unless_present_any = ["stdin", "file"], conflicts_with_all = ["stdin", "file"])]
+        text: Option<String>,
+        /// Read the note body from standard input
+        #[arg(long)]
+        stdin: bool,
+        /// Read the note body from a file
+        #[arg(short = 'f', long = "file", value_name = "PATH", conflicts_with = "stdin")]
+        file: Option<PathBuf>,
         /// What kind of note: note, finding, decision, blocker, attempt, …
         #[arg(short, long, default_value = "note")]
         kind: String,
@@ -325,6 +600,70 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// Commands about the store itself, which must never be redirected to a
+    /// repo-level file by the unregistered-repository fallback.
+    fn wants_store(&self) -> bool {
+        matches!(
+            self,
+            Commands::Project { .. } | Commands::Import { stdin: false, .. } | Commands::Migrate { .. }
+        )
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectAction {
+    /// Register a repository (default: the one the current directory is in)
+    Add {
+        path: Option<PathBuf>,
+        /// Project name (default: the directory name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Every registered project with its open card count
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the project the current directory resolves to
+    Current {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Let `bl next` and the default views pick this project up again
+    Activate { name: String },
+    /// Park a project: skipped by `bl next`, hidden from the default views
+    Deactivate { name: String },
+    /// Drop a project row. Refuses while it still has cards unless --force.
+    Remove {
+        name: String,
+        /// Delete the project and every card and note under it
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum NoteAction {
+    /// Rewrite one note's text and/or kind (`bl notes <card>` prints the ids)
+    Edit {
+        note_id: i64,
+        text: Option<String>,
+        #[arg(short, long)]
+        kind: Option<String>,
+        /// Who is editing, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// Remove one note by its id
+    Rm {
+        note_id: i64,
+        /// Who is removing it, for the event log
+        #[arg(long)]
+        by: Option<String>,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum AutoAction {
     /// Refresh a snapshot on every write (writes it once, now)
@@ -339,19 +678,133 @@ enum AutoAction {
     Status,
 }
 
-fn db_path(cli: &Cli) -> PathBuf {
-    if let Some(p) = &cli.db {
-        return p.clone();
+/// Everything a command needs to know about where it is working.
+struct Ctx {
+    conn: Connection,
+    path: PathBuf,
+    /// The shared store under `~/.bl`, as opposed to a `--db` file.
+    central: bool,
+    /// The project this command is scoped to, when one could be resolved.
+    project: Option<Project>,
+    /// `--all`: read across active projects even inside a repository.
+    all: bool,
+}
+
+impl Ctx {
+    /// The project a new card belongs to. Central mode outside any registered
+    /// repository has nowhere to put one, and says so.
+    fn require_project(&self) -> Result<&Project> {
+        match &self.project {
+            Some(p) => Ok(p),
+            None if self.central => bail!(
+                "this directory is not inside a registered project: pass --project <name>, \
+                 or run `bl project add` from the repository"
+            ),
+            None => bail!("this database has no project row; run `bl init --db {}`", self.path.display()),
+        }
     }
-    if let Ok(p) = env::var("BL_DB") {
-        return PathBuf::from(p);
+
+    /// The SQL that limits a read to the right cards: the current project, or
+    /// every active project when none is scoped (or `--all` was given).
+    /// Returns the clause (starting with ` AND `) and the id to bind, if any.
+    fn scope(&self) -> (String, Option<i64>) {
+        match (&self.project, self.all) {
+            (Some(p), false) => (" AND cards.project_id = ?".to_string(), Some(p.id)),
+            _ if self.central => (
+                " AND cards.project_id IN (SELECT id FROM projects WHERE active = 1)".to_string(),
+                None,
+            ),
+            _ => (String::new(), None),
+        }
     }
-    PathBuf::from(DEFAULT_DB)
+
+    /// Where git runs for `--commit`: the project's checkout, not wherever the
+    /// database file happens to sit.
+    fn git_dir(&self) -> PathBuf {
+        match &self.project {
+            Some(p) if !p.path.is_empty() => PathBuf::from(&p.path),
+            _ => absolute(&self.path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(".")),
+        }
+    }
+}
+
+/// Open the database a command should use and work out its project. Never
+/// creates a file: an empty board minted in the wrong directory is how every
+/// wrapper script and hook around this tool came to exist. `bl init` is the
+/// only command that creates.
+fn open_ctx(cli: &Cli, command: &Commands) -> Result<Ctx> {
+    let (path, central) = match store::target(cli.db.as_deref())? {
+        store::Target::Explicit(p) => (p, false),
+        store::Target::Central(p) => (p, true),
+        store::Target::RepoLocal(p) => (p, false),
+    };
+    if !path.exists() {
+        bail!(
+            "database not found: {}\nRun `bl init --db {}` to create it.",
+            path.display(),
+            path.display()
+        );
+    }
+    let conn = open_db(&path)?;
+    ensure_schema(&conn, &path)?;
+    let project = store::resolve_project(&conn, central, cli.project.as_deref())?;
+
+    // A repository that still carries its own backlog.db and is not registered
+    // in the store keeps working against that file, so nothing breaks between
+    // creating the store and importing each project into it.
+    if central && project.is_none() && cli.project.is_none() && !command.wants_store() {
+        let local = PathBuf::from(DEFAULT_DB);
+        if local.exists() {
+            eprintln!(
+                "bl: using ./backlog.db (this repository is not registered in {}; \
+                 `bl import` moves it there)",
+                path.display()
+            );
+            drop(conn);
+            let conn = open_db(&local)?;
+            ensure_schema(&conn, &local)?;
+            let project = store::resolve_project(&conn, false, None)?;
+            return Ok(Ctx {
+                conn,
+                path: local,
+                central: false,
+                project,
+                all: cli.all,
+            });
+        }
+    }
+    Ok(Ctx {
+        conn,
+        path,
+        central,
+        project,
+        all: cli.all,
+    })
 }
 
 fn open_db(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("failed to open database at {}", path.display()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    Ok(conn)
+}
+
+/// The one place a database file comes into being.
+fn create_db(path: &Path) -> Result<Connection> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+    }
     let conn = Connection::open(path)
-        .with_context(|| format!("failed to open database at {}", path.display()))?;
+        .with_context(|| format!("failed to create database at {}", path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     Ok(conn)
 }
@@ -365,8 +818,22 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(names.iter().any(|n| n == column))
 }
 
-fn ensure_schema(conn: &Connection) -> Result<()> {
+fn ensure_schema(conn: &Connection, path: &Path) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
+
+    // Cards learned which project they belong to when the central store
+    // arrived. The index is created here, after the column is certain to
+    // exist, rather than in the base schema.
+    if !column_exists(conn, "cards", "project_id")? {
+        conn.execute_batch("ALTER TABLE cards ADD COLUMN project_id INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_project ON cards(project_id, status);")?;
+
+    // The id a card had in the repo-level database it was imported from.
+    if !column_exists(conn, "cards", "legacy_id")? {
+        conn.execute_batch("ALTER TABLE cards ADD COLUMN legacy_id INTEGER;")?;
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_legacy ON cards(project_id, legacy_id);")?;
 
     // Migrate older DBs that lack claim columns / in_progress status
     if !column_exists(conn, "cards", "claimed_by")? {
@@ -381,7 +848,10 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE cards ADD COLUMN commits TEXT NOT NULL DEFAULT '';")?;
     }
 
-    // Detect old CHECK constraint (no in_progress) via sqlite_master, then rebuild table.
+    // The status CHECK constraint has grown twice (in_progress, then
+    // blocked); SQLite cannot alter a CHECK, so a table from before either
+    // is rebuilt once. Foreign keys go off first: with them on, DROP TABLE
+    // cards would cascade-delete every note.
     let table_sql: String = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='cards'",
@@ -389,46 +859,186 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             |r| r.get(0),
         )
         .unwrap_or_default();
-    let needs_status_migrate =
-        !table_sql.is_empty() && !table_sql.contains("in_progress");
+    if !table_sql.is_empty() && (!table_sql.contains("in_progress") || !table_sql.contains("'blocked'")) {
+        rebuild_cards_table(conn)?;
+    }
 
-    if needs_status_migrate {
-        conn.execute_batch(
-            r#"
-            BEGIN;
-            CREATE TABLE cards_new (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                title       TEXT NOT NULL,
-                notes       TEXT NOT NULL DEFAULT '',
-                label       TEXT NOT NULL DEFAULT '',
-                status      TEXT NOT NULL DEFAULT 'new'
-                            CHECK(status IN ('new', 'ready', 'in_progress', 'done')),
-                priority    INTEGER NOT NULL DEFAULT 5000
-                            CHECK(priority BETWEEN 0 AND 10000),
-                outcome     TEXT NOT NULL DEFAULT '',
-                claimed_by  TEXT NOT NULL DEFAULT '',
-                claimed_at  TEXT NOT NULL DEFAULT '',
-                commits     TEXT NOT NULL DEFAULT '',
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            INSERT INTO cards_new (id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at)
-            SELECT id, title, notes, label, status, priority, outcome,
-                   COALESCE(claimed_by, ''), COALESCE(claimed_at, ''),
-                   COALESCE(commits, ''),
-                   created_at, updated_at
-            FROM cards;
-            DROP TABLE cards;
-            ALTER TABLE cards_new RENAME TO cards;
-            CREATE INDEX IF NOT EXISTS idx_status_priority ON cards(status, priority DESC, created_at ASC);
-            CREATE INDEX IF NOT EXISTS idx_label ON cards(label);
-            CREATE INDEX IF NOT EXISTS idx_claimed_by ON cards(claimed_by);
-            COMMIT;
-            "#,
+    // Why a card is parked, for the blocked status.
+    if !column_exists(conn, "cards", "blocked_on")? {
+        conn.execute_batch("ALTER TABLE cards ADD COLUMN blocked_on TEXT NOT NULL DEFAULT '';")?;
+    }
+
+    // Labels became tag lists: `art enemies c676 build` is four tags, stored
+    // as `art,enemies,c676,build`. Done once per database, marked in meta.
+    if meta_get(conn, "labels_tagged")?.is_none() {
+        let legacy: Vec<(i64, String)> = {
+            let mut stmt = conn.prepare("SELECT id, label FROM cards WHERE label != ''")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        conn.execute_batch("BEGIN;")?;
+        for (id, label) in legacy {
+            let tagged = normalize_tags(&label);
+            if tagged != label {
+                conn.execute("UPDATE cards SET label = ?1 WHERE id = ?2", params![tagged, id])?;
+            }
+        }
+        meta_set(conn, "labels_tagged", "1")?;
+        conn.execute_batch("COMMIT;")?;
+    }
+
+    // A database from before projects existed holds one repository's cards.
+    // Give it a project row named after the directory the file sits in, so
+    // `bl import` and the views have something to attach those cards to.
+    let unassigned: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cards WHERE project_id = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    if unassigned > 0 {
+        let existing = store::all(conn)?;
+        let target = match existing.first() {
+            Some(p) if existing.len() == 1 => p.clone(),
+            Some(_) => bail!(
+                "{} unassigned card(s) in a database with several projects; \
+                 `bl edit --where project_id=0 --project <name>` is not available yet, \
+                 so assign them by hand before continuing",
+                unassigned
+            ),
+            None => {
+                let dir = absolute(path)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                store::add(conn, &dir, None, &now_str())?
+            }
+        };
+        conn.execute(
+            "UPDATE cards SET project_id = ?1 WHERE project_id = 0",
+            params![target.id],
         )?;
     }
 
+    // Stamp what this build brought the database to. Only ever moves up, so
+    // a newer build's mark is not undone by an older one opening the file.
+    let stamped: i64 = meta_get(conn, "schema_version")?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if stamped < SCHEMA_VERSION {
+        meta_set(conn, "schema_version", &SCHEMA_VERSION.to_string())?;
+    }
+
     Ok(())
+}
+
+/// `bl --version`: the binary's version and, when a database can be found,
+/// the schema version stamped in it. Read-only: asking does not migrate.
+fn print_version(cli: &Cli) -> Result<()> {
+    println!("bl {}  (schema {})", env!("CARGO_PKG_VERSION"), SCHEMA_VERSION);
+    let path = match store::target(cli.db.as_deref()) {
+        Ok(store::Target::Explicit(p)) | Ok(store::Target::Central(p)) | Ok(store::Target::RepoLocal(p)) => p,
+        Err(_) => {
+            println!("database: none found (`bl init` creates the store)");
+            return Ok(());
+        }
+    };
+    if !path.exists() {
+        println!("database: {} (missing)", path.display());
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let has_meta: bool = conn
+        .query_row("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'", [], |_| Ok(()))
+        .optional()?
+        .is_some();
+    let stamped: Option<i64> = if has_meta {
+        meta_get(&conn, "schema_version")?.and_then(|v| v.parse().ok())
+    } else {
+        None
+    };
+    let verdict = match stamped {
+        Some(v) if v == SCHEMA_VERSION => "current".to_string(),
+        Some(v) if v < SCHEMA_VERSION => format!("older; the next command brings it to {}", SCHEMA_VERSION),
+        Some(v) => format!("written by a newer bl (schema {}); upgrade this binary", v),
+        None => format!("unstamped, written before 0.5; the next command brings it to {}", SCHEMA_VERSION),
+    };
+    println!(
+        "database: {}  schema {}  ({})",
+        path.display(),
+        stamped.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string()),
+        verdict
+    );
+    Ok(())
+}
+
+/// Recreate `cards` with the current CHECK constraints, keeping every row
+/// and id. Runs with foreign keys off inside one transaction, the way the
+/// SQLite documentation prescribes, then checks nothing dangles.
+fn rebuild_cards_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys=OFF;")?;
+    let has_blocked_on = column_exists(conn, "cards", "blocked_on")?;
+    let result = conn.execute_batch(&format!(
+        r#"
+        BEGIN IMMEDIATE;
+        CREATE TABLE cards_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT NOT NULL,
+            notes       TEXT NOT NULL DEFAULT '',
+            label       TEXT NOT NULL DEFAULT '',
+            status      TEXT NOT NULL DEFAULT 'new'
+                        CHECK(status IN ('new', 'ready', 'in_progress', 'blocked', 'done')),
+            priority    INTEGER NOT NULL DEFAULT 5000
+                        CHECK(priority BETWEEN 0 AND 10000),
+            outcome     TEXT NOT NULL DEFAULT '',
+            claimed_by  TEXT NOT NULL DEFAULT '',
+            claimed_at  TEXT NOT NULL DEFAULT '',
+            commits     TEXT NOT NULL DEFAULT '',
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            project_id  INTEGER NOT NULL DEFAULT 0,
+            legacy_id   INTEGER,
+            blocked_on  TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO cards_new (id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, legacy_id, blocked_on)
+        SELECT id, title, notes, label, status, priority, outcome,
+               COALESCE(claimed_by, ''), COALESCE(claimed_at, ''),
+               COALESCE(commits, ''),
+               created_at, updated_at, COALESCE(project_id, 0), legacy_id, {blocked_on}
+        FROM cards;
+        DROP TABLE cards;
+        ALTER TABLE cards_new RENAME TO cards;
+        CREATE INDEX IF NOT EXISTS idx_status_priority ON cards(status, priority DESC, created_at ASC);
+        CREATE INDEX IF NOT EXISTS idx_label ON cards(label);
+        CREATE INDEX IF NOT EXISTS idx_claimed_by ON cards(claimed_by);
+        CREATE INDEX IF NOT EXISTS idx_project ON cards(project_id, status);
+        CREATE INDEX IF NOT EXISTS idx_legacy ON cards(project_id, legacy_id);
+        COMMIT;
+        "#,
+        blocked_on = if has_blocked_on { "COALESCE(blocked_on, '')" } else { "''" }
+    ));
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
+    result?;
+    let bad: Option<i64> = conn
+        .query_row("PRAGMA foreign_key_check", [], |r| r.get::<_, i64>(2))
+        .optional()?;
+    if let Some(row) = bad {
+        bail!("cards rebuild left a dangling note (rowid {})", row);
+    }
+    Ok(())
+}
+
+/// The project a card belongs to, for refreshing the right snapshot.
+fn card_project(conn: &Connection, id: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT project_id FROM cards WHERE id = ?",
+        params![id],
+        |r| r.get(0),
+    )
+    .ok()
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -446,10 +1056,26 @@ pub(crate) struct Card {
     pub(crate) commits: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
+    pub(crate) project_id: i64,
+    /// The project's name, resolved at read time so a card always says
+    /// which repository it is about.
+    pub(crate) project: String,
+    /// The id this card had in the repo-level database it was imported from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) legacy_id: Option<i64>,
+    /// Who or what a blocked card waits on.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) blocked_on: String,
     /// The notes as rows. Empty unless the caller asked for them, and always
     /// empty for a database old enough to lack the table.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) entries: Vec<Note>,
+    /// The audit trail, oldest first. Filled with `entries`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) events: Vec<Event>,
+    /// What this card waits on, blocks, belongs to, owns or relates to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) links: Vec<Rel>,
 }
 
 pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
@@ -466,25 +1092,61 @@ pub(crate) fn row_to_card(row: &rusqlite::Row<'_>) -> rusqlite::Result<Card> {
         commits: row.get(9)?,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
+        project_id: row.get::<_, i64>(12).unwrap_or(0),
+        project: row.get::<_, String>(13).unwrap_or_default(),
+        legacy_id: row.get::<_, Option<i64>>(14).unwrap_or(None),
+        blocked_on: row.get::<_, Option<String>>(15).ok().flatten().unwrap_or_default(),
         entries: Vec::new(),
+        events: Vec::new(),
+        links: Vec::new(),
     })
 }
 
 /// Fill in each card's notes. Skipped silently where the table is absent, so a
 /// legacy database still lists and serves.
 pub(crate) fn load_entries(conn: &Connection, cards: &mut [Card]) {
-    if !notes::table_exists(conn) {
+    let has_notes = notes::table_exists(conn);
+    let has_events = events::table_exists(conn);
+    for c in cards.iter_mut() {
+        if has_notes {
+            c.entries = notes::list(conn, c.id).unwrap_or_default();
+        }
+        if has_events {
+            c.events = events::list(conn, c.id).unwrap_or_default();
+        }
+    }
+    load_links(conn, cards);
+}
+
+/// Fill in each card's relations (cheap; done for text listings too, so a
+/// card that waits on another says so wherever it is printed).
+pub(crate) fn load_links(conn: &Connection, cards: &mut [Card]) {
+    if !links::table_exists(conn) {
         return;
     }
     for c in cards.iter_mut() {
-        c.entries = notes::list(conn, c.id).unwrap_or_default();
+        c.links = links::of(conn, c.id).unwrap_or_default();
     }
 }
 
-pub(crate) const SELECT_COLS: &str =
-    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at";
+/// The plain columns of a card, in `row_to_card` order.
+pub(crate) const CARD_COLS: &str =
+    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id";
 
-fn print_card(c: &Card, json: bool) {
+/// Columns that come after the project name in `row_to_card` order.
+pub(crate) const TRAILING_COLS: &str = "legacy_id, blocked_on";
+
+/// The project's name, looked up per row. No comma-space inside, so
+/// `read_cards` can still split the list on `", "`.
+pub(crate) const PROJECT_COL: &str =
+    "IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project";
+
+pub(crate) const SELECT_COLS: &str =
+    "id, title, notes, label, status, priority, outcome, claimed_by, claimed_at, commits, created_at, updated_at, project_id, IFNULL((SELECT name FROM projects WHERE projects.id=cards.project_id),'') AS project, legacy_id, blocked_on";
+
+/// Print a card. `show_project` puts the project name on the first line, for
+/// listings that span more than one.
+fn print_card(c: &Card, json: bool, show_project: bool) {
     if json {
         println!("{}", serde_json::to_string_pretty(c).unwrap());
     } else {
@@ -494,10 +1156,15 @@ fn print_card(c: &Card, json: bool) {
             format!("  claimed_by={}", c.claimed_by)
         };
         println!(
-            "#{}  [{:>5}]  {:12}  {}{}{}",
+            "#{}  [{:>5}]  {:12}  {}{}{}{}",
             c.id,
             c.priority,
             c.status,
+            if show_project && !c.project.is_empty() {
+                format!("{}: ", c.project)
+            } else {
+                String::new()
+            },
             if c.label.is_empty() {
                 String::new()
             } else {
@@ -515,6 +1182,29 @@ fn print_card(c: &Card, json: bool) {
         if !c.claimed_at.is_empty() {
             println!("    claimed_at: {}", c.claimed_at);
         }
+        if !c.blocked_on.is_empty() {
+            println!("    blocked on: {}", c.blocked_on);
+        }
+        if let Some(old) = c.legacy_id {
+            println!("    imported: was #{} in {}'s own backlog.db", old, c.project);
+        }
+        for rel in ["blocked_by", "blocks", "child_of", "parent_of", "related"] {
+            let items: Vec<String> = c
+                .links
+                .iter()
+                .filter(|l| l.rel == rel)
+                .map(|l| {
+                    if rel == "blocked_by" {
+                        format!("#{} ({}) {}", l.id, l.status, l.title)
+                    } else {
+                        format!("#{} {}", l.id, l.title)
+                    }
+                })
+                .collect();
+            if !items.is_empty() {
+                println!("    {}: {}", links::label(rel), items.join(", "));
+            }
+        }
         for line in c.commits.lines().filter(|l| !l.trim().is_empty()) {
             let (sha, subject) = line.split_once('\t').unwrap_or((line, ""));
             println!("    commit: {} {}", sha, subject);
@@ -524,20 +1214,25 @@ fn print_card(c: &Card, json: bool) {
 }
 
 /// Databases the board may read: the primary one plus any `--also` paths.
-/// Creates/migrates the primary so a fresh project still opens to a board.
-fn view_sources(path: &Path, also: Vec<PathBuf>) -> Result<Vec<view::Source>> {
-    let conn = open_db(path)?;
-    ensure_schema(&conn)?;
-    drop(conn);
-
+/// The primary is scoped like every other read; an `--also` file is shown
+/// whole, since nothing is known about its projects.
+fn view_sources(ctx: &Ctx, also: Vec<PathBuf>) -> Result<Vec<view::Source>> {
+    let (project, label) = match (&ctx.project, ctx.all) {
+        (Some(p), false) => (Some(p.id), p.name.clone()),
+        _ => (None, source_label(&ctx.path)),
+    };
     let mut sources = vec![view::Source {
-        label: source_label(path),
-        path: path.to_path_buf(),
+        label,
+        path: ctx.path.clone(),
+        project,
+        active_only: ctx.central,
     }];
     for p in also {
         sources.push(view::Source {
             label: source_label(&p),
             path: p,
+            project: None,
+            active_only: false,
         });
     }
     Ok(sources)
@@ -590,9 +1285,10 @@ fn absolute(p: &Path) -> PathBuf {
         .unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// Where — if anywhere — the HTML snapshot should be kept in sync.
+/// Where — if anywhere — the HTML snapshot for the current scope is kept in
+/// sync: the project's own path inside a repository, else the store-wide one.
 /// `BL_AUTOEXPORT` overrides the stored path; `BL_NO_AUTOEXPORT` turns it off.
-fn autoexport_target(conn: &Connection) -> Option<PathBuf> {
+fn autoexport_target(ctx: &Ctx) -> Option<PathBuf> {
     if env::var_os("BL_NO_AUTOEXPORT").is_some() {
         return None;
     }
@@ -601,22 +1297,56 @@ fn autoexport_target(conn: &Connection) -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    meta_get(conn, "autoexport")
+    if let Some(p) = &ctx.project {
+        if !p.autoexport.is_empty() {
+            return Some(PathBuf::from(&p.autoexport));
+        }
+    }
+    meta_get(&ctx.conn, "autoexport")
         .ok()
         .flatten()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
 }
 
-/// Rewrite the snapshot after a write, so the view pages never serve stale
-/// cards. Best-effort: a failed refresh must not fail the command that
-/// already committed.
-fn refresh_views(conn: &Connection, db: &Path) {
-    let Some(out) = autoexport_target(conn) else {
-        return;
-    };
-    if let Err(e) = view::refresh(db, &out) {
-        eprintln!("bl: auto-export to {} failed: {}", out.display(), e);
+/// Every snapshot a write may have made stale: the touched card's project (or
+/// all of them when `card` is None) plus the store-wide page. Each pair is
+/// (output path, project filter).
+fn stale_snapshots(ctx: &Ctx, card: Option<i64>) -> Vec<(PathBuf, Option<i64>)> {
+    if env::var_os("BL_NO_AUTOEXPORT").is_some() {
+        return Vec::new();
+    }
+    if let Ok(p) = env::var("BL_AUTOEXPORT") {
+        if !p.is_empty() {
+            let scope = ctx.project.as_ref().filter(|_| !ctx.all).map(|p| p.id);
+            return vec![(PathBuf::from(p), scope)];
+        }
+    }
+    let mut out = Vec::new();
+    let touched = card.and_then(|id| card_project(&ctx.conn, id));
+    for p in store::all(&ctx.conn).unwrap_or_default() {
+        if p.autoexport.is_empty() {
+            continue;
+        }
+        if touched.map(|t| t == p.id).unwrap_or(true) {
+            out.push((PathBuf::from(&p.autoexport), Some(p.id)));
+        }
+    }
+    if let Some(global) = meta_get(&ctx.conn, "autoexport").ok().flatten().filter(|s| !s.is_empty()) {
+        out.push((PathBuf::from(global), None));
+    }
+    out
+}
+
+/// Rewrite the snapshots after a write, so the view pages never serve stale
+/// cards. `card` is the card just touched, so only its project's page is
+/// redrawn; None redraws every project's. Best-effort: a failed refresh must
+/// not fail the command that already committed.
+fn refresh_views(ctx: &Ctx, card: Option<i64>) {
+    for (out, project) in stale_snapshots(ctx, card) {
+        if let Err(e) = view::refresh(&ctx.path, project, ctx.central, &out) {
+            eprintln!("bl: auto-export to {} failed: {}", out.display(), e);
+        }
     }
 }
 
@@ -674,29 +1404,42 @@ const AGENT_PROMPT: &str = include_str!("agent.md");
 
 /// The agent instructions, filled in with this backlog's actual path, labels and
 /// view setup — a generic prompt makes an agent guess at exactly those things.
-fn agent_prompt(conn: &Connection, db: &Path) -> Result<String> {
+fn agent_prompt(ctx: &Ctx) -> Result<String> {
+    let conn = &ctx.conn;
+    let db = &ctx.path;
     let labels: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT label, COUNT(*) FROM cards
-             WHERE label != '' AND status != 'done'
-             GROUP BY label ORDER BY COUNT(*) DESC, label ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(format!("{} ({})", r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        let collected: Vec<String> = rows.filter_map(|r| r.ok()).collect();
-        collected
+        let (scope, bind) = ctx.scope();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT label FROM cards WHERE label != '' AND status != 'done'{}",
+            scope
+        ))?;
+        let binds: Vec<Box<dyn rusqlite::ToSql>> = match bind {
+            Some(id) => vec![Box::new(id)],
+            None => Vec::new(),
+        };
+        let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |r| r.get::<_, String>(0))?;
+        // Counted per tag, since a card may carry several.
+        let mut counts: std::collections::BTreeMap<String, i64> = Default::default();
+        for label in rows.filter_map(|r| r.ok()) {
+            for t in tags_of(&label) {
+                *counts.entry(t).or_default() += 1;
+            }
+        }
+        let mut pairs: Vec<(String, i64)> = counts.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        pairs.into_iter().map(|(t, n)| format!("{} ({})", t, n)).collect()
     };
     let labels = if labels.is_empty() {
         String::new()
     } else {
         format!(
-            "\n## Labels in use\n\n{}\n\nReuse one of these rather than inventing a near-duplicate.\n",
+            "\n## Tags in use\n\n{}\n\nReuse one of these rather than inventing a near-duplicate; a card may carry several (`-l art,enemies`).\n",
             labels.join(", ")
         )
     };
 
-    let auto = match autoexport_target(conn) {
+    let auto = match autoexport_target(ctx) {
         Some(t) => format!(
             "\nThe board at `{}` refreshes itself on every write — never run `bl export`.\n",
             t.display()
@@ -704,29 +1447,34 @@ fn agent_prompt(conn: &Connection, db: &Path) -> Result<String> {
         None => String::new(),
     };
 
+    let project = match &ctx.project {
+        Some(p) => format!(
+            "This repository is project **{}** (#{}, `{}`). Commands run from inside it,\n\
+             or any of its worktrees, are scoped to it automatically; nothing has to be pinned.",
+            p.name, p.id, p.path
+        ),
+        None if ctx.central => "No project is scoped: this directory is not a registered repository. \
+             Pass `--project <name>` or run `bl project add`."
+            .to_string(),
+        None => String::new(),
+    };
+
     Ok(AGENT_PROMPT
         .replace("{{DB}}", &absolute(db).display().to_string())
+        .replace("{{PROJECT}}", &project)
         .replace("{{AUTO}}", &auto)
         .replace("{{LABELS}}", &labels))
 }
 
 // ---------------------------------------------------------------- git
 
-/// Directory to run git in: the backlog's own directory, since that is the
-/// repository the cards are about.
-fn git_dir(db: &Path) -> PathBuf {
-    absolute(db)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// Resolve a revision (default `HEAD`) to `(short sha, subject)`.
-fn resolve_commit(db: &Path, rev: &str) -> Result<(String, String)> {
+/// Resolve a revision (default `HEAD`) to `(short sha, subject)` in the
+/// project's repository.
+fn resolve_commit(ctx: &Ctx, rev: &str) -> Result<(String, String)> {
     let rev = if rev.trim().is_empty() { "HEAD" } else { rev.trim() };
     let out = std::process::Command::new("git")
         .arg("-C")
-        .arg(git_dir(db))
+        .arg(ctx.git_dir())
         .args(["--no-pager", "log", "-1", "--format=%h%x09%s", rev, "--"])
         .output()
         .context("failed to run git (is it installed and on PATH?)")?;
@@ -762,18 +1510,806 @@ fn link_commit(existing: &str, sha: &str, subject: &str) -> String {
     }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let path = db_path(&cli);
+// ---------------------------------------------------------------- edit
 
-    match cli.command {
-        Commands::Init => {
-            if path.exists() {
-                println!("database already exists: {}", path.display());
+#[derive(Default)]
+struct EditFields {
+    title: Option<String>,
+    label: Option<String>,
+    priority: Option<i32>,
+    notes: Option<String>,
+    outcome: Option<String>,
+    status: Option<Status>,
+    move_to: Option<String>,
+    by: String,
+    force: bool,
+    add_tags: Vec<String>,
+    rm_tags: Vec<String>,
+}
+
+/// Apply every given field in one transaction. Returns the names of the
+/// fields that changed, for the confirmation line.
+/// The fields of a card an edit or delete may need to compare against.
+struct Snapshot {
+    title: String,
+    label: String,
+    priority: i32,
+    outcome: String,
+    status: String,
+    claimed_by: String,
+    project_id: i64,
+    notes: String,
+    blocked_on: String,
+}
+
+fn snapshot(conn: &Connection, id: i64) -> Result<Option<Snapshot>> {
+    Ok(conn
+        .query_row(
+            "SELECT title, label, priority, outcome, status, claimed_by, project_id, notes, blocked_on
+             FROM cards WHERE id = ?",
+            params![id],
+            |r| {
+                Ok(Snapshot {
+                    title: r.get(0)?,
+                    label: r.get(1)?,
+                    priority: r.get(2)?,
+                    outcome: r.get(3)?,
+                    status: r.get(4)?,
+                    claimed_by: r.get(5)?,
+                    project_id: r.get(6)?,
+                    notes: r.get(7)?,
+                    blocked_on: r.get(8)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Run `f` inside one IMMEDIATE transaction, rolling back on error.
+fn transaction<T>(conn: &Connection, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    match f() {
+        Ok(v) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+fn edit_card(ctx: &Ctx, id: i64, f: EditFields) -> Result<Vec<String>> {
+    let conn = &ctx.conn;
+    let now = now_str();
+    let (changed, moved) = transaction(conn, || apply_edit(conn, id, &f, &now))?;
+    // A move leaves the old project's page stale too, so redraw every page.
+    refresh_views(ctx, if moved { None } else { Some(id) });
+    Ok(changed)
+}
+
+/// `--set field=value` in the vocabulary of `EditFields`.
+fn parse_set(f: &mut EditFields, pair: &str) -> Result<()> {
+    let (k, v) = pair
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--set wants FIELD=VALUE, got '{}'", pair))?;
+    let v = v.to_string();
+    match k.trim() {
+        "title" => f.title = Some(v),
+        "label" => f.label = Some(v),
+        "priority" => f.priority = Some(v.trim().parse().with_context(|| format!("priority '{}' is not a number", v))?),
+        "outcome" => f.outcome = Some(v),
+        "notes" => f.notes = Some(v),
+        "status" => {
+            f.status = Some(
+                <Status as ValueEnum>::from_str(v.trim(), true)
+                    .map_err(|_| anyhow::anyhow!("status '{}' is not one of new, ready, in_progress, blocked, done", v))?,
+            )
+        }
+        "project" | "move" => f.move_to = Some(v),
+        other => bail!("--set does not know the field '{}' (title, label, priority, outcome, notes, status, project)", other),
+    }
+    Ok(())
+}
+
+/// `--where field=value` (and `priority<N`, `priority>N`, `<=`, `>=`) as an
+/// SQL clause starting with ` AND `, plus the value to bind.
+fn parse_where(conn: &Connection, expr: &str) -> Result<(String, Box<dyn rusqlite::ToSql>)> {
+    let ops = ["<=", ">=", "!=", "=", "<", ">"];
+    let (k, op, v) = ops
+        .iter()
+        .find_map(|op| expr.split_once(op).map(|(k, v)| (k.trim(), *op, v.trim())))
+        .ok_or_else(|| anyhow::anyhow!("--where wants FIELD=VALUE, got '{}'", expr))?;
+    let text_ops = matches!(op, "=" | "!=");
+    match k {
+        "priority" | "id" => {
+            let n: i64 = v.parse().with_context(|| format!("{} '{}' is not a number", k, v))?;
+            Ok((format!(" AND {} {} ?", k, op), Box::new(n)))
+        }
+        "label" | "tag" if text_ops => Ok((
+            format!(
+                " AND (',' || label || ',') {} ?",
+                if op == "=" { "LIKE" } else { "NOT LIKE" }
+            ),
+            Box::new(format!("%,{},%", v)),
+        )),
+        "status" | "claimed_by" | "title" | "outcome" if text_ops => {
+            Ok((format!(" AND {} {} ?", k, op), Box::new(v.to_string())))
+        }
+        "project" if text_ops => {
+            let p = store::lookup(conn, v)?.ok_or_else(|| anyhow::anyhow!("no project named '{}'", v))?;
+            Ok((format!(" AND project_id {} ?", op), Box::new(p.id)))
+        }
+        _ => bail!(
+            "--where does not understand '{}' (label, status, claimed_by, title, outcome, project with = or !=; priority, id with = != < > <= >=)",
+            expr
+        ),
+    }
+}
+
+/// The cards `--where` selects, inside the current scope, lowest id first.
+fn select_where(ctx: &Ctx, wheres: &[String]) -> Result<Vec<(i64, String)>> {
+    let conn = &ctx.conn;
+    let mut sql = String::from("SELECT id, title FROM cards WHERE 1=1");
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let (scope, pid) = ctx.scope();
+    sql.push_str(&scope);
+    if let Some(pid) = pid {
+        binds.push(Box::new(pid));
+    }
+    for w in wheres {
+        let (clause, bind) = parse_where(conn, w)?;
+        sql.push_str(&clause);
+        binds.push(bind);
+    }
+    sql.push_str(" ORDER BY id ASC");
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// Apply the same change to several cards in one transaction; every card
+/// gets its own event rows. Returns the fields changed on the first card.
+fn bulk_edit(ctx: &Ctx, ids: &[i64], f: &EditFields) -> Result<Vec<String>> {
+    let conn = &ctx.conn;
+    let now = now_str();
+    let mut changed = Vec::new();
+    transaction(conn, || {
+        for id in ids {
+            let (c, _) = apply_edit(conn, *id, f, &now)?;
+            if changed.is_empty() {
+                changed = c;
             }
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
-            println!("initialized {}", path.display());
+        }
+        Ok(())
+    })?;
+    refresh_views(ctx, None);
+    Ok(changed)
+}
+
+/// Every field of one edit, inside the caller's transaction. Returns the
+/// names of the fields that changed and whether the card moved project.
+fn apply_edit(conn: &Connection, id: i64, f: &EditFields, now: &str) -> Result<(Vec<String>, bool)> {
+    let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+    let mut sets: Vec<String> = Vec::new();
+    let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+
+    // Tags: --label replaces, --add-tag / --rm-tag adjust what is there.
+    let new_label: Option<String> = if f.label.is_some() || !f.add_tags.is_empty() || !f.rm_tags.is_empty() {
+        let mut tags = tags_of(f.label.as_deref().unwrap_or(&old.label));
+        for t in f.add_tags.iter().flat_map(|t| tags_of(t)) {
+            if !tags.contains(&t) {
+                tags.push(t);
+            }
+        }
+        let drop: Vec<String> = f.rm_tags.iter().flat_map(|t| tags_of(t)).collect();
+        tags.retain(|t| !drop.contains(t));
+        Some(tags.join(","))
+    } else {
+        None
+    };
+
+    if let Some(t) = &f.title {
+        check_title(t, f.force)?;
+        sets.push("title = ?".into());
+        binds.push(Box::new(t.trim().to_string()));
+        changed.push("title".into());
+    }
+    if let Some(l) = &new_label {
+        sets.push("label = ?".into());
+        binds.push(Box::new(l.clone()));
+        changed.push("label".into());
+    }
+    if let Some(p) = f.priority {
+        if !(0..=10000).contains(&p) {
+            bail!("priority must be 0..=10000");
+        }
+        sets.push("priority = ?".into());
+        binds.push(Box::new(p));
+        changed.push("priority".into());
+    }
+    if let Some(o) = &f.outcome {
+        check_outcome(o, f.force)?;
+        sets.push("outcome = ?".into());
+        binds.push(Box::new(o.clone()));
+        changed.push("outcome".into());
+    }
+    if let Some(st) = &f.status {
+        sets.push("status = ?".into());
+        binds.push(Box::new(st.as_str().to_string()));
+        // The same rule as `bl status`: leaving in_progress drops the claim,
+        // and leaving blocked drops the reason.
+        if st.clears_claim() {
+            sets.push("claimed_by = ''".into());
+            sets.push("claimed_at = ''".into());
+        }
+        if !matches!(st, Status::Blocked) {
+            sets.push("blocked_on = ''".into());
+        }
+        changed.push("status".into());
+    }
+    let mut moved: Option<Project> = None;
+    if let Some(key) = &f.move_to {
+        let p = store::lookup(conn, key)?
+            .ok_or_else(|| anyhow::anyhow!("no project named '{}'", key))?;
+        sets.push("project_id = ?".into());
+        binds.push(Box::new(p.id));
+        changed.push(format!("project → {}", p.name));
+        moved = Some(p);
+    }
+    if f.notes.is_some() {
+        changed.push("notes".into());
+    }
+    if changed.is_empty() {
+        bail!("nothing to change: give at least one of --title --label --add-tag --rm-tag --priority --notes --outcome --status --move");
+    }
+
+    {
+        if !sets.is_empty() {
+            sets.push("updated_at = ?".into());
+            binds.push(Box::new(now.to_string()));
+            binds.push(Box::new(id));
+            let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+            conn.execute(
+                &format!("UPDATE cards SET {} WHERE id = ?", sets.join(", ")),
+                refs.as_slice(),
+            )?;
+        }
+        if let Some(text) = &f.notes {
+            // Replace, not append: `bl note` appends. The rows go with the blob
+            // so the two views of the notes stay one thing.
+            let old_n: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM notes WHERE card_id = ?",
+                params![id],
+                |r| r.get(0),
+            )?;
+            conn.execute("DELETE FROM notes WHERE card_id = ?", params![id])?;
+            conn.execute(
+                "UPDATE cards SET notes = ?1, updated_at = ?2 WHERE id = ?3",
+                params![text, now, id],
+            )?;
+            notes::reconcile(conn, id)?;
+            if old_n > 0 {
+                eprintln!("bl: #{} had {} note(s); they are replaced, not kept", id, old_n);
+            }
+        }
+        // One event per field that actually changed, so the history reads
+        // like a diff rather than a list of commands.
+        let ev = |kind: &str, before: &str, after: &str| -> Result<()> {
+            if before != after {
+                events::record(conn, id, Some(old.project_id), kind, before, after, &f.by, now)?;
+            }
+            Ok(())
+        };
+        if let Some(t) = &f.title {
+            ev("title", &old.title, t.trim())?;
+        }
+        if let Some(l) = &new_label {
+            ev("label", &old.label, l)?;
+        }
+        if let Some(p) = f.priority {
+            ev("priority", &old.priority.to_string(), &p.to_string())?;
+        }
+        if let Some(o) = &f.outcome {
+            ev("outcome", &old.outcome, o)?;
+        }
+        if let Some(st) = &f.status {
+            ev("status", &old.status, st.as_str())?;
+            if !old.claimed_by.is_empty() && st.clears_claim() {
+                ev("release", &old.claimed_by, "")?;
+            }
+            if !matches!(st, Status::Blocked) && !old.blocked_on.is_empty() {
+                ev("blocked_on", &old.blocked_on, "")?;
+            }
+        }
+        if let Some(p) = &moved {
+            let from = store::by_id(conn, old.project_id)?
+                .map(|p| p.name)
+                .unwrap_or_else(|| old.project_id.to_string());
+            ev("move", &from, &p.name)?;
+        }
+        if let Some(text) = &f.notes {
+            ev("notes", &old.notes, text)?;
+        }
+    }
+    Ok((changed, moved.is_some()))
+}
+
+// ---------------------------------------------------------------- tags
+
+/// `bl list -l 5` almost always meant `-n 5`. Say so when the tag is all
+/// digits and matched nothing, instead of printing an empty board.
+fn warn_numeric_label(label: Option<&str>, matched: usize) {
+    if let Some(l) = label {
+        if matched == 0 && !l.is_empty() && l.chars().all(|c| c.is_ascii_digit()) {
+            eprintln!(
+                "bl: -l/--label filters by tag and no card carries the tag '{}'; to cap the count use -n {}",
+                l, l
+            );
+        }
+    }
+}
+
+/// A card's label is a comma-separated list of tags. Input may use commas or
+/// spaces; the stored form is `a,b,c` with no blanks and no repeats.
+pub(crate) fn tags_of(label: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in label.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = t.trim();
+        if !t.is_empty() && !out.iter().any(|x| x == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+pub(crate) fn normalize_tags(label: &str) -> String {
+    tags_of(label).join(",")
+}
+
+/// `-l art` or `-l art,ui`: a card matches when it carries any of the tags.
+/// Returns the clause (starting with ` AND `) and its binds.
+pub(crate) fn tag_clause(filter: &str) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let tags = tags_of(filter);
+    if tags.is_empty() {
+        return (" AND label = ''".to_string(), Vec::new());
+    }
+    let ors: Vec<&str> = tags.iter().map(|_| "(',' || label || ',') LIKE ?").collect();
+    let binds: Vec<Box<dyn rusqlite::ToSql>> = tags
+        .iter()
+        .map(|t| Box::new(format!("%,{},%", t)) as Box<dyn rusqlite::ToSql>)
+        .collect();
+    (format!(" AND ({})", ors.join(" OR ")), binds)
+}
+
+// ---------------------------------------------------------------- links
+
+/// Add or remove relations, one event per card touched, all in one
+/// transaction. Nothing to do at all is an error, so a typo does not exit 0.
+fn link_cmd(ctx: &Ctx, triples: &[(i64, &str, i64)], add: bool, by: &str) -> Result<()> {
+    let conn = &ctx.conn;
+    if triples.is_empty() {
+        bail!("say how they relate: --blocks <id>, --child-of <id> or --related <id>");
+    }
+    let now = now_str();
+    let mut touched: Vec<i64> = Vec::new();
+    transaction(conn, || {
+        for (from, kind, to) in triples {
+            let describe = |a: i64, b: i64| -> String {
+                match *kind {
+                    "blocks" => format!("#{} blocks #{}", a, b),
+                    "child_of" => format!("#{} child of #{}", a, b),
+                    _ => format!("#{} related to #{}", a, b),
+                }
+            };
+            let did = if add {
+                links::add(conn, *from, kind, *to, by, &now)?
+            } else {
+                links::remove(conn, *from, kind, *to)?
+            };
+            let what = describe(*from, *to);
+            if !did {
+                println!("{}: {}", if add { "already linked" } else { "no such link" }, what);
+                continue;
+            }
+            for card in [*from, *to] {
+                events::record(
+                    conn, card, None,
+                    if add { "link" } else { "unlink" },
+                    if add { "" } else { &what },
+                    if add { &what } else { "" },
+                    by, &now,
+                )?;
+                touched.push(card);
+            }
+            println!("{}: {}", if add { "linked" } else { "unlinked" }, what);
+        }
+        Ok(())
+    })?;
+    if !touched.is_empty() {
+        refresh_views(ctx, None);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- guards
+
+/// Titles and outcomes are headlines; the detail belongs in notes. Boards
+/// where agents ignored that ended up with 500-character titles.
+pub(crate) const TITLE_MAX: usize = 120;
+pub(crate) const OUTCOME_MAX: usize = 300;
+
+pub(crate) fn check_title(title: &str, force: bool) -> Result<()> {
+    if title.trim().is_empty() {
+        bail!("a title cannot be empty");
+    }
+    let n = title.trim().chars().count();
+    if n > TITLE_MAX && !force {
+        bail!(
+            "title is {} characters (limit {}): keep the title to one line and put the detail in a note \
+             (`bl note <id> \"...\"`), or pass --force",
+            n, TITLE_MAX
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn check_outcome(outcome: &str, force: bool) -> Result<()> {
+    let n = outcome.chars().count();
+    if n > OUTCOME_MAX && !force {
+        bail!(
+            "outcome is {} characters (limit {}): say the result in a line and put the detail in a note \
+             (`bl note <id> \"...\" -k finding`), or pass --force",
+            n, OUTCOME_MAX
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- delete
+
+/// Remove one card and its notes inside the caller's transaction, leaving a
+/// `deleted` event that carries everything the card said so `bl history`
+/// can still show it. Refuses a claimed card unless `force`.
+fn delete_card(conn: &Connection, id: i64, why: &str, force: bool, by: &str, now: &str) -> Result<Snapshot> {
+    let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+    if !old.claimed_by.is_empty() && !force {
+        bail!(
+            "card #{} is claimed by '{}'; `bl release {}` first, or --force",
+            id, old.claimed_by, id
+        );
+    }
+    notes::reconcile(conn, id)?;
+    let mut payload = format!(
+        "title: {}\nstatus: {}\npriority: {}",
+        old.title, old.status, old.priority
+    );
+    if !old.label.is_empty() {
+        payload.push_str(&format!("\nlabel: {}", old.label));
+    }
+    if !old.outcome.is_empty() {
+        payload.push_str(&format!("\noutcome: {}", old.outcome));
+    }
+    if !old.blocked_on.is_empty() {
+        payload.push_str(&format!("\nblocked on: {}", old.blocked_on));
+    }
+    for n in notes::list(conn, id)? {
+        payload.push_str(&format!(
+            "\nnote {} [{}]{}: {}",
+            n.created_at,
+            n.kind,
+            if n.author.is_empty() { String::new() } else { format!(" {}", n.author) },
+            n.body
+        ));
+    }
+    events::record(conn, id, Some(old.project_id), "deleted", &payload, why, by, now)?;
+    links::drop_all(conn, id)?;
+    conn.execute("DELETE FROM notes WHERE card_id = ?", params![id])?;
+    conn.execute("DELETE FROM cards WHERE id = ?", params![id])?;
+    Ok(old)
+}
+
+// ---------------------------------------------------------------- init
+
+/// The only command that creates a database. Without `--db` it creates the
+/// central store and registers the repository the shell is in; with `--db`
+/// it creates (or migrates) that one file and gives it its project row.
+fn init(cli: &Cli) -> Result<()> {
+    let now = now_str();
+    let explicit = cli.db.clone().or_else(|| {
+        env::var("BL_DB")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    });
+
+    match explicit {
+        Some(path) => {
+            let existed = path.exists();
+            let conn = if existed { open_db(&path)? } else { create_db(&path)? };
+            ensure_schema(&conn, &path)?;
+            if store::all(&conn)?.is_empty() {
+                let dir = absolute(&path)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let p = store::add(&conn, &dir, cli.project.as_deref(), &now)?;
+                println!("registered project '{}' (#{}) at {}", p.name, p.id, p.path);
+            }
+            println!(
+                "{} {}",
+                if existed { "migrated" } else { "initialized" },
+                path.display()
+            );
+        }
+        None => {
+            let path = store::central_db_path();
+            let existed = path.exists();
+            let conn = if existed { open_db(&path)? } else { create_db(&path)? };
+            ensure_schema(&conn, &path)?;
+            store::write_default_config(&path)?;
+            println!(
+                "{} central store {}",
+                if existed { "using" } else { "initialized" },
+                path.display()
+            );
+            match store::git_main_root(None) {
+                Some(root) => match store::by_path(&conn, &root)? {
+                    Some(p) => println!("project '{}' (#{}) already registered at {}", p.name, p.id, p.path),
+                    None => {
+                        let p = store::add(&conn, &root, cli.project.as_deref(), &now)?;
+                        println!("registered project '{}' (#{}) at {}", p.name, p.id, p.path);
+                        if root.join(DEFAULT_DB).exists() {
+                            println!(
+                                "note: {} has its own backlog.db; until it is imported, commands run \
+                                 there keep using it",
+                                p.path
+                            );
+                        }
+                    }
+                },
+                None => println!(
+                    "not inside a git repository; `bl project add <path>` registers one"
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- projects
+
+#[derive(serde::Serialize)]
+struct ProjectRow {
+    #[serde(flatten)]
+    project: Project,
+    open: i64,
+    total: i64,
+}
+
+fn project_cmd(ctx: &Ctx, action: ProjectAction) -> Result<()> {
+    let conn = &ctx.conn;
+    match action {
+        ProjectAction::Add { path, name } => {
+            let dir = match path {
+                Some(p) => store::canon(&p),
+                None => store::git_main_root(None)
+                    .or_else(|| env::current_dir().ok())
+                    .context("cannot tell which directory to register")?,
+            };
+            let p = store::add(conn, &dir, name.as_deref(), &now_str())?;
+            println!("registered project '{}' (#{}) at {}", p.name, p.id, p.path);
+            if dir.join(DEFAULT_DB).exists() {
+                println!(
+                    "note: {} has its own backlog.db; import it into this store and delete the copy",
+                    p.path
+                );
+            }
+        }
+
+        ProjectAction::List { json } => {
+            let mut rows = Vec::new();
+            for p in store::all(conn)? {
+                let open = store::open_card_count(conn, p.id)?;
+                let total = store::card_count(conn, p.id)?;
+                rows.push(ProjectRow { project: p, open, total });
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("(no projects; `bl project add` registers one)");
+            } else {
+                for r in &rows {
+                    let here = ctx
+                        .project
+                        .as_ref()
+                        .map(|p| p.id == r.project.id)
+                        .unwrap_or(false);
+                    println!(
+                        "#{:<3} {} {:<24} {:>4} open / {:<4} {}{}",
+                        r.project.id,
+                        if r.project.active { "active  " } else { "inactive" },
+                        r.project.name,
+                        r.open,
+                        r.total,
+                        r.project.path,
+                        if here { "  (here)" } else { "" }
+                    );
+                }
+            }
+        }
+
+        ProjectAction::Current { json } => match &ctx.project {
+            Some(p) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(p)?);
+                } else {
+                    println!(
+                        "#{}  {}  {}  {}",
+                        p.id,
+                        p.name,
+                        if p.active { "active" } else { "inactive" },
+                        p.path
+                    );
+                }
+            }
+            None => {
+                if json {
+                    println!("null");
+                } else {
+                    println!("(no project for this directory)");
+                }
+                exit_with(EXIT_EMPTY);
+            }
+        },
+
+        ProjectAction::Activate { name } => {
+            let p = store::lookup(conn, &name)?
+                .ok_or_else(|| anyhow::anyhow!("no project named '{}'", name))?;
+            store::set_active(conn, p.id, true)?;
+            println!("project '{}' active", p.name);
+        }
+
+        ProjectAction::Deactivate { name } => {
+            let p = store::lookup(conn, &name)?
+                .ok_or_else(|| anyhow::anyhow!("no project named '{}'", name))?;
+            store::set_active(conn, p.id, false)?;
+            println!("project '{}' inactive: skipped by bl next, hidden from the default views", p.name);
+        }
+
+        ProjectAction::Remove { name, force } => {
+            let p = store::lookup(conn, &name)?
+                .ok_or_else(|| anyhow::anyhow!("no project named '{}'", name))?;
+            let total = store::card_count(conn, p.id)?;
+            if total > 0 && !force {
+                bail!(
+                    "project '{}' still has {} card(s); deactivate it, or --force to delete them too",
+                    p.name,
+                    total
+                );
+            }
+            let now = now_str();
+            transaction(conn, || {
+                let ids: Vec<i64> = {
+                    let mut stmt = conn.prepare("SELECT id FROM cards WHERE project_id = ? ORDER BY id")?;
+                    let rows = stmt.query_map(params![p.id], |r| r.get(0))?;
+                    rows.filter_map(|r| r.ok()).collect()
+                };
+                for id in ids {
+                    delete_card(conn, id, &format!("project '{}' removed", p.name), true, "", &now)?;
+                }
+                store::remove(conn, p.id)
+            })?;
+            println!("removed project '{}' ({} card(s) deleted)", p.name, total);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- main
+
+fn main() -> Result<()> {
+    // `bl list | head` must end quietly. Rust ignores SIGPIPE, so a closed
+    // pipe otherwise turns every println! into a panic with a backtrace.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+    let mut cli = Cli::parse();
+
+    if cli.version {
+        return print_version(&cli);
+    }
+    let Some(command) = cli.command.take() else {
+        // clap prints help for a bare `bl`; a lone global flag lands here.
+        bail!("no command given; `bl --help` lists them");
+    };
+
+    // Init creates files; nothing else may, so it is handled before a
+    // database is opened.
+    if matches!(command, Commands::Init) {
+        return init(&cli);
+    }
+
+    let ctx = open_ctx(&cli, &command)?;
+    let conn = &ctx.conn;
+    // Listings that span projects say which project each card is from.
+    let multi = ctx.project.is_none() || ctx.all;
+
+    match command {
+        Commands::Init => unreachable!("handled above"),
+
+        Commands::Project { action } => project_cmd(&ctx, action)?,
+
+        Commands::Import { source: None, by, if_absent, dry_run, .. } => {
+            let out = import::from_stdin(&ctx, by.as_deref().unwrap_or(""), if_absent, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            if dry_run {
+                eprintln!("bl: dry run, {} card(s) would be created", out.len());
+            } else {
+                let made = out.iter().filter(|c| c.created).count();
+                eprintln!("bl: {} card(s) created, {} already present", made, out.len() - made);
+                if made > 0 {
+                    refresh_views(&ctx, None);
+                }
+            }
+        }
+
+        Commands::Import { source: Some(source), dry_run, json, .. } => {
+            // The global --project names (or creates) the target project.
+            let out = import::run(&ctx, &source, cli.project.as_deref(), dry_run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("{}", import::summary(&out));
+                if !dry_run {
+                    for (old, new) in &out.imported {
+                        println!("  #{} → #{}", old, new);
+                    }
+                    if !out.imported.is_empty() {
+                        println!(
+                            "notes still say #<old>; `bl show <new>` prints the old id, and the map above is the key.\n\
+                             Delete or gitignore {} so nothing writes to it again.",
+                            out.source
+                        );
+                    }
+                }
+            }
+            if !dry_run && !out.imported.is_empty() {
+                refresh_views(&ctx, None);
+            }
+        }
+
+        Commands::Migrate { scan, dry_run, json } => {
+            let found = import::candidates(&ctx, &scan)?;
+            if found.is_empty() {
+                println!("nothing to import (no backlog.db beside a registered project or under --scan)");
+                exit_with(EXIT_EMPTY);
+            }
+            let mut outs = Vec::new();
+            for db in found {
+                match import::run(&ctx, &db, None, dry_run) {
+                    Ok(o) => {
+                        if !json {
+                            println!("{}", import::summary(&o));
+                        }
+                        outs.push(o);
+                    }
+                    Err(e) => eprintln!("bl: {}: {}", db.display(), e),
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outs)?);
+            }
+            if !dry_run && outs.iter().any(|o| !o.imported.is_empty()) {
+                refresh_views(&ctx, None);
+            }
         }
 
         Commands::Create {
@@ -782,19 +2318,23 @@ fn main() -> Result<()> {
             priority,
             notes: notes_text,
             if_absent,
+            by,
+            force,
         } => {
             if !(0..=10000).contains(&priority) {
                 bail!("priority must be 0..=10000");
             }
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
+            check_title(&title, force)?;
+            let title = title.trim().to_string();
+            let label = normalize_tags(&label);
+            let project = ctx.require_project()?;
             let now = now_str();
 
             if if_absent {
                 let existing: Option<i64> = conn
                     .query_row(
-                        "SELECT id FROM cards WHERE title = ? ORDER BY id ASC LIMIT 1",
-                        params![title],
+                        "SELECT id FROM cards WHERE title = ?1 AND project_id = ?2 ORDER BY id ASC LIMIT 1",
+                        params![title, project.id],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -804,81 +2344,227 @@ fn main() -> Result<()> {
                 }
             }
             conn.execute(
-                "INSERT INTO cards (title, notes, label, priority, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                params![title, notes_text, label, priority, now],
+                "INSERT INTO cards (title, notes, label, priority, created_at, updated_at, project_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
+                params![title, notes_text, label, priority, now, project.id],
             )?;
             let id = conn.last_insert_rowid();
             // Notes given at creation become a first row like any other.
             if !notes_text.is_empty() {
-                notes::reconcile(&conn, id)?;
+                notes::reconcile(conn, id)?;
             }
-            println!("created #{}  priority={}  label={}", id, priority, label);
-            refresh_views(&conn, &path);
+            events::record(conn, id, Some(project.id), "created", "", &title, by.as_deref().unwrap_or(""), &now)?;
+            println!(
+                "created #{}  priority={}  label={}  project={}",
+                id, priority, label, project.name
+            );
+            refresh_views(&ctx, Some(id));
         }
 
-        Commands::SetPriority { id, priority } => {
+        Commands::Edit {
+            id,
+            ids,
+            r#where,
+            set,
+            dry_run,
+            title,
+            label,
+            add_tag,
+            rm_tag,
+            priority,
+            notes: notes_text,
+            outcome,
+            status,
+            r#move,
+            by,
+            force,
+            json,
+        } => {
+            let mut fields = EditFields {
+                title,
+                label,
+                priority,
+                notes: notes_text,
+                outcome,
+                status,
+                move_to: r#move,
+                by: by.unwrap_or_default(),
+                force,
+                add_tags: add_tag,
+                rm_tags: rm_tag,
+            };
+            for pair in &set {
+                parse_set(&mut fields, pair)?;
+            }
+            // One card: the original verb. Several: --ids or --where.
+            let targets: Vec<(i64, String)> = if let Some(id) = id {
+                vec![(id, String::new())]
+            } else if let Some(list) = &ids {
+                let mut out = Vec::new();
+                for part in list.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()) {
+                    let n: i64 = part.trim_start_matches('#').parse()
+                        .with_context(|| format!("'{}' is not a card id", part))?;
+                    let title: String = conn
+                        .query_row("SELECT title FROM cards WHERE id = ?", params![n], |r| r.get(0))
+                        .optional()?
+                        .ok_or_else(|| anyhow::anyhow!("card #{} not found", n))?;
+                    out.push((n, title));
+                }
+                out
+            } else if !r#where.is_empty() {
+                select_where(&ctx, &r#where)?
+            } else {
+                bail!("which card? give an id, --ids 1,2,3 or --where FIELD=VALUE");
+            };
+            let bulk = id.is_none();
+            if bulk && targets.is_empty() {
+                println!("(no cards match)");
+                exit_with(EXIT_EMPTY);
+            }
+            if dry_run {
+                for (n, t) in &targets {
+                    println!("#{}  {}", n, t);
+                }
+                println!("would edit {} card(s); nothing written", targets.len());
+                return Ok(());
+            }
+            if bulk {
+                let only: Vec<i64> = targets.iter().map(|(n, _)| *n).collect();
+                let changed = bulk_edit(&ctx, &only, &fields)?;
+                if json {
+                    let list = only.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+                    let mut cards: Vec<Card> = {
+                        let mut stmt = conn.prepare(&format!(
+                            "SELECT {} FROM cards WHERE id IN ({}) ORDER BY id", SELECT_COLS, list
+                        ))?;
+                        let rows = stmt.query_map([], row_to_card)?;
+                        rows.filter_map(|r| r.ok()).collect()
+                    };
+                    load_entries(conn, &mut cards);
+                    println!("{}", serde_json::to_string_pretty(&cards)?);
+                } else {
+                    println!("edited {} card(s): {}", only.len(), changed.join(", "));
+                }
+            } else {
+                let id = targets[0].0;
+                let changed = edit_card(&ctx, id, fields)?;
+                if json {
+                    let mut c: Card = conn.query_row(
+                        &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
+                        params![id],
+                        row_to_card,
+                    )?;
+                    load_entries(conn, std::slice::from_mut(&mut c));
+                    print_card(&c, true, true);
+                } else {
+                    println!("#{} edited: {}", id, changed.join(", "));
+                }
+            }
+        }
+
+        Commands::Retitle { id, title, force } => {
+            edit_card(
+                &ctx,
+                id,
+                EditFields {
+                    title: Some(title.clone()),
+                    force,
+                    ..Default::default()
+                },
+            )?;
+            println!("#{} retitled: {}", id, title);
+        }
+
+        Commands::Delete { id, why, force, by } => {
+            let now = now_str();
+            let old = transaction(conn, || {
+                delete_card(conn, id, why.as_deref().unwrap_or(""), force, by.as_deref().unwrap_or(""), &now)
+            })?;
+            println!("#{} deleted: {}  (bl history {} keeps its notes)", id, old.title, id);
+            refresh_views(&ctx, None);
+        }
+
+        Commands::SetPriority { id, priority, by } => {
             if !(0..=10000).contains(&priority) {
                 bail!("priority must be 0..=10000");
             }
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let now = now_str();
-            let n = conn.execute(
-                "UPDATE cards SET priority = ?1, updated_at = ?2 WHERE id = ?3",
-                params![priority, now, id],
-            )?;
-            if n == 0 {
-                bail!("card #{} not found", id);
-            }
+            transaction(conn, || {
+                let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+                conn.execute(
+                    "UPDATE cards SET priority = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![priority, now, id],
+                )?;
+                if old.priority != priority {
+                    events::record(conn, id, Some(old.project_id), "priority", &old.priority.to_string(), &priority.to_string(), by.as_deref().unwrap_or(""), &now)?;
+                }
+                Ok(())
+            })?;
             println!("#{} priority → {}", id, priority);
-            refresh_views(&conn, &path);
+            refresh_views(&ctx, Some(id));
         }
 
-        Commands::Status { id, status, outcome } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
+        Commands::Status { id, status, outcome, by, force, on } => {
+            check_outcome(&outcome, force)?;
             let now = now_str();
-            // Clear claim when leaving in_progress (or explicitly setting ready/new/done)
-            let clear_claim = matches!(status, Status::New | Status::Ready | Status::Done);
-            let n = if outcome.is_empty() {
-                if clear_claim {
-                    conn.execute(
-                        "UPDATE cards SET status = ?1, claimed_by = '', claimed_at = '', updated_at = ?2 WHERE id = ?3",
-                        params![status.as_str(), now, id],
-                    )?
-                } else {
-                    conn.execute(
-                        "UPDATE cards SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![status.as_str(), now, id],
-                    )?
-                }
-            } else if clear_claim {
-                conn.execute(
-                    "UPDATE cards SET status = ?1, outcome = ?2, claimed_by = '', claimed_at = '', updated_at = ?3 WHERE id = ?4",
-                    params![status.as_str(), outcome, now, id],
-                )?
-            } else {
-                conn.execute(
-                    "UPDATE cards SET status = ?1, outcome = ?2, updated_at = ?3 WHERE id = ?4",
-                    params![status.as_str(), outcome, now, id],
-                )?
+            let who = by.unwrap_or_default();
+            let reason = match (&status, &on) {
+                (Status::Blocked, Some(r)) if !r.trim().is_empty() => r.trim().to_string(),
+                (Status::Blocked, _) => bail!("blocked on what? `--on <who>` or `--on #<card>`"),
+                (_, Some(_)) => bail!("--on goes with `blocked`"),
+                _ => String::new(),
             };
-            if n == 0 {
-                bail!("card #{} not found", id);
-            }
+            // Any status but in_progress drops the claim; leaving blocked drops the reason.
+            let clear_claim = status.clears_claim();
+            transaction(conn, || {
+                let old = snapshot(conn, id)?.ok_or_else(|| anyhow::anyhow!("card #{} not found", id))?;
+                let mut sets = vec!["status = ?1", "updated_at = ?2", "blocked_on = ?3"];
+                if !outcome.is_empty() {
+                    sets.push("outcome = ?4");
+                }
+                if clear_claim {
+                    sets.push("claimed_by = ''");
+                    sets.push("claimed_at = ''");
+                }
+                conn.execute(
+                    &format!("UPDATE cards SET {} WHERE id = ?5", sets.join(", ")),
+                    params![status.as_str(), now, reason, outcome, id],
+                )?;
+                if old.status != status.as_str() {
+                    events::record(conn, id, Some(old.project_id), "status", &old.status, status.as_str(), &who, &now)?;
+                }
+                if clear_claim && !old.claimed_by.is_empty() {
+                    events::record(conn, id, Some(old.project_id), "release", &old.claimed_by, "", &who, &now)?;
+                }
+                if !outcome.is_empty() && old.outcome != outcome {
+                    events::record(conn, id, Some(old.project_id), "outcome", &old.outcome, &outcome, &who, &now)?;
+                }
+                if old.blocked_on != reason {
+                    events::record(conn, id, Some(old.project_id), "blocked_on", &old.blocked_on, &reason, &who, &now)?;
+                }
+                // `--on #12` is also a dependency: #12 blocks this card.
+                if let Some(other) = reason.strip_prefix('#').and_then(|n| n.parse::<i64>().ok()) {
+                    if other != id && links::add(conn, other, "blocks", id, &who, &now).unwrap_or(false) {
+                        let what = format!("#{} blocks #{}", other, id);
+                        for card in [other, id] {
+                            events::record(conn, card, None, "link", "", &what, &who, &now)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
             println!("#{} status → {}", id, status);
-            refresh_views(&conn, &path);
+            refresh_views(&ctx, Some(id));
         }
 
         Commands::Claim { id, by } => {
             if by.trim().is_empty() {
                 bail!("--by must be a non-empty agent identity");
             }
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let now = now_str();
             // Atomic claim: only if currently ready (or new) and unclaimed
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let old = snapshot(conn, id)?;
             let n = conn.execute(
                 "UPDATE cards
                  SET status = 'in_progress',
@@ -890,7 +2576,13 @@ fn main() -> Result<()> {
                    AND (claimed_by = '' OR claimed_by IS NULL)",
                 params![by, now, id],
             )?;
-            if n == 0 {
+            if n == 1 {
+                let old = old.expect("row just updated");
+                events::record(conn, id, Some(old.project_id), "status", &old.status, "in_progress", &by, &now)?;
+                events::record(conn, id, Some(old.project_id), "claim", "", &by, &by, &now)?;
+                conn.execute_batch("COMMIT;")?;
+            } else {
+                conn.execute_batch("ROLLBACK;")?;
                 // Diagnose why
                 let row: Option<(String, String)> = conn
                     .query_row(
@@ -902,7 +2594,6 @@ fn main() -> Result<()> {
                 match row {
                     None => bail!("card #{} not found", id),
                     Some((st, cb)) if st == "in_progress" || !cb.is_empty() => {
-                    {
                         // Contention, not a failure: the loop should move on.
                         eprintln!(
                             "bl: card #{} already claimed by '{}'",
@@ -911,20 +2602,19 @@ fn main() -> Result<()> {
                         );
                         exit_with(EXIT_CONTENDED);
                     }
-                    }
                     Some((st, _)) => {
                         bail!("card #{} is status '{}' (must be new or ready to claim)", id, st)
                     }
                 }
             }
             println!("#{} claimed by {}", id, by);
-            refresh_views(&conn, &path);
+            refresh_views(&ctx, Some(id));
         }
 
         Commands::Release { id, by } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let now = now_str();
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let old = snapshot(conn, id)?;
             let n = if let Some(ref agent) = by {
                 conn.execute(
                     "UPDATE cards
@@ -949,6 +2639,15 @@ fn main() -> Result<()> {
                     params![now, id],
                 )?
             };
+            if n == 1 {
+                let old = old.expect("row just updated");
+                let who = by.clone().unwrap_or_default();
+                events::record(conn, id, Some(old.project_id), "status", &old.status, "ready", &who, &now)?;
+                events::record(conn, id, Some(old.project_id), "release", &old.claimed_by, "", &who, &now)?;
+                conn.execute_batch("COMMIT;")?;
+            } else {
+                conn.execute_batch("ROLLBACK;")?;
+            }
             if n == 0 {
                 let row: Option<(String, String)> = conn
                     .query_row(
@@ -971,7 +2670,7 @@ fn main() -> Result<()> {
                 }
             }
             println!("#{} released → ready", id);
-            refresh_views(&conn, &path);
+            refresh_views(&ctx, Some(id));
         }
 
         Commands::List {
@@ -980,18 +2679,19 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
-
-            let mut sql = format!(
-                "SELECT {} FROM cards WHERE 1=1",
-                SELECT_COLS
-            );
+            let mut sql = format!("SELECT {} FROM cards WHERE 1=1", SELECT_COLS);
             let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
+            let (scope, pid) = ctx.scope();
+            sql.push_str(&scope);
+            if let Some(pid) = pid {
+                binds.push(Box::new(pid));
+            }
+
             if let Some(l) = &label {
-                sql.push_str(" AND label = ?");
-                binds.push(Box::new(l.clone()));
+                let (clause, tag_binds) = tag_clause(l);
+                sql.push_str(&clause);
+                binds.extend(tag_binds);
             }
 
             if let Some(s) = &status {
@@ -1018,10 +2718,12 @@ fn main() -> Result<()> {
             let mut stmt = conn.prepare(&sql)?;
             let params_ref: Vec<&dyn rusqlite::ToSql> =
                 binds.iter().map(|b| b.as_ref()).collect();
-            let cards: Vec<Card> = stmt
+            let mut cards: Vec<Card> = stmt
                 .query_map(params_ref.as_slice(), row_to_card)?
                 .filter_map(|r| r.ok())
                 .collect();
+            load_links(conn, &mut cards);
+            warn_numeric_label(label.as_deref(), cards.len());
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&cards)?);
@@ -1029,7 +2731,7 @@ fn main() -> Result<()> {
                 println!("(no cards)");
             } else {
                 for c in &cards {
-                    print_card(c, false);
+                    print_card(c, false, multi);
                     println!();
                 }
                 println!("{} card(s)", cards.len());
@@ -1043,8 +2745,7 @@ fn main() -> Result<()> {
             by,
             json,
         } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
+            let (scope, pid) = ctx.scope();
 
             if claim {
                 let agent = match &by {
@@ -1056,31 +2757,36 @@ fn main() -> Result<()> {
                 // Pick highest-priority new/ready unclaimed card, then claim in one transaction
                 conn.execute_batch("BEGIN IMMEDIATE;")?;
 
-                let mut sql = String::from(
-                    "SELECT id FROM cards WHERE status IN ('ready'",
-                );
+                let mut sql = String::from("SELECT id, status FROM cards WHERE status IN ('ready'");
                 if !ready_only {
                     sql.push_str(", 'new'");
                 }
                 sql.push_str(") AND (claimed_by = '' OR claimed_by IS NULL)");
+                sql.push_str(links::NOT_BLOCKED);
+                sql.push_str(&scope);
 
                 let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                if let Some(pid) = pid {
+                    binds.push(Box::new(pid));
+                }
                 if let Some(l) = &label {
-                    sql.push_str(" AND label = ?");
-                    binds.push(Box::new(l.clone()));
+                    let (clause, tag_binds) = tag_clause(l);
+                    sql.push_str(&clause);
+                    binds.extend(tag_binds);
                 }
                 sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT 1");
 
-                let id: Option<i64> = {
+                let picked: Option<(i64, String)> = {
                     let mut stmt = conn.prepare(&sql)?;
                     let params_ref: Vec<&dyn rusqlite::ToSql> =
                         binds.iter().map(|b| b.as_ref()).collect();
-                    stmt.query_row(params_ref.as_slice(), |r| r.get(0))
+                    stmt.query_row(params_ref.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
                         .optional()?
                 };
 
-                let Some(id) = id else {
+                let Some((id, prev_status)) = picked else {
                     conn.execute_batch("ROLLBACK;")?;
+                    warn_numeric_label(label.as_deref(), 0);
                     if json {
                         println!("null");
                     } else {
@@ -1107,16 +2813,19 @@ fn main() -> Result<()> {
                     conn.execute_batch("ROLLBACK;")?;
                     bail!("failed to claim #{} (race?)", id);
                 }
+                events::record(conn, id, None, "status", &prev_status, "in_progress", &agent, &now)?;
+                events::record(conn, id, None, "claim", "", &agent, &agent, &now)?;
 
                 conn.execute_batch("COMMIT;")?;
-                refresh_views(&conn, &path);
+                refresh_views(&ctx, Some(id));
 
-                let card: Card = conn.query_row(
+                let mut card: Card = conn.query_row(
                     &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
                     params![id],
                     row_to_card,
                 )?;
-                print_card(&card, json);
+                load_links(conn, std::slice::from_mut(&mut card));
+                print_card(&card, json, multi);
             } else {
                 // Read-only next (no claim)
                 let mut sql = format!(
@@ -1127,11 +2836,17 @@ fn main() -> Result<()> {
                     sql.push_str(", 'new'");
                 }
                 sql.push(')');
+                sql.push_str(links::NOT_BLOCKED);
+                sql.push_str(&scope);
 
                 let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                if let Some(pid) = pid {
+                    binds.push(Box::new(pid));
+                }
                 if let Some(l) = &label {
-                    sql.push_str(" AND label = ?");
-                    binds.push(Box::new(l.clone()));
+                    let (clause, tag_binds) = tag_clause(l);
+                    sql.push_str(&clause);
+                    binds.extend(tag_binds);
                 }
                 sql.push_str(" ORDER BY priority DESC, created_at ASC LIMIT 1");
 
@@ -1145,11 +2860,14 @@ fn main() -> Result<()> {
                 match card {
                     Some(mut c) => {
                         if json {
-                            load_entries(&conn, std::slice::from_mut(&mut c));
+                            load_entries(conn, std::slice::from_mut(&mut c));
+                        } else {
+                            load_links(conn, std::slice::from_mut(&mut c));
                         }
-                        print_card(&c, json);
+                        print_card(&c, json, multi);
                     }
                     None => {
+                        warn_numeric_label(label.as_deref(), 0);
                         if json {
                             println!("null");
                         } else {
@@ -1161,9 +2879,54 @@ fn main() -> Result<()> {
             }
         }
 
+        Commands::Link { id, blocks, child_of, related, by } => {
+            let mut triples: Vec<(i64, &str, i64)> = Vec::new();
+            triples.extend(blocks.iter().map(|o| (id, "blocks", *o)));
+            triples.extend(child_of.iter().map(|o| (id, "child_of", *o)));
+            triples.extend(related.iter().map(|o| (id, "related", *o)));
+            link_cmd(&ctx, &triples, true, by.as_deref().unwrap_or(""))?;
+        }
+
+        Commands::Block { id, on, by } => {
+            // `bl block X --on Y` reads the way a human says it: X waits on Y.
+            let triples: Vec<(i64, &str, i64)> = on.iter().map(|o| (*o, "blocks", id)).collect();
+            link_cmd(&ctx, &triples, true, by.as_deref().unwrap_or(""))?;
+        }
+
+        Commands::Unlink { id, blocks, child_of, related, by } => {
+            let mut triples: Vec<(i64, &str, i64)> = Vec::new();
+            triples.extend(blocks.iter().map(|o| (id, "blocks", *o)));
+            triples.extend(child_of.iter().map(|o| (id, "child_of", *o)));
+            triples.extend(related.iter().map(|o| (id, "related", *o)));
+            link_cmd(&ctx, &triples, false, by.as_deref().unwrap_or(""))?;
+        }
+
+        Commands::History { id, json } => {
+            let evs = events::list(conn, id)?;
+            if evs.is_empty() {
+                let exists: Option<i64> = conn
+                    .query_row("SELECT id FROM cards WHERE id = ?", params![id], |r| r.get(0))
+                    .optional()?;
+                if exists.is_none() {
+                    bail!("card #{} not found and it left no history", id);
+                }
+                if json {
+                    println!("[]");
+                } else {
+                    println!("(no events; #{} predates the event log)", id);
+                }
+                exit_with(EXIT_EMPTY);
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&evs)?);
+            } else {
+                for e in &evs {
+                    println!("{}", events::render_line(e));
+                }
+            }
+        }
+
         Commands::Show { id, json } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let card: Option<Card> = conn
                 .query_row(
                     &format!("SELECT {} FROM cards WHERE id = ?", SELECT_COLS),
@@ -1173,26 +2936,84 @@ fn main() -> Result<()> {
                 .optional()?;
             match card {
                 Some(mut c) => {
-                    notes::reconcile(&conn, id)?;
+                    notes::reconcile(conn, id)?;
                     if json {
-                        load_entries(&conn, std::slice::from_mut(&mut c));
+                        load_entries(conn, std::slice::from_mut(&mut c));
+                    } else {
+                        load_links(conn, std::slice::from_mut(&mut c));
                     }
-                    print_card(&c, json);
+                    print_card(&c, json, true);
                 }
                 None => bail!("card #{} not found", id),
             }
         }
 
         Commands::Note {
+            action: Some(NoteAction::Edit { note_id, text, kind, by }),
+            ..
+        } => {
+            if text.is_none() && kind.is_none() {
+                bail!("nothing to change: give new text and/or --kind");
+            }
+            let now = now_str();
+            let (card_id, old) = transaction(conn, || {
+                let (card_id, old) = notes::edit(conn, note_id, text.as_deref(), kind.as_deref(), &now)?;
+                let who = by.as_deref().unwrap_or("");
+                if let Some(t) = &text {
+                    if *t != old.body {
+                        events::record(conn, card_id, None, "note_edit", &old.body, t, who, &now)?;
+                    }
+                }
+                if let Some(k) = &kind {
+                    if *k != old.kind {
+                        events::record(conn, card_id, None, "note_kind", &old.kind, k, who, &now)?;
+                    }
+                }
+                Ok((card_id, old))
+            })?;
+            println!("note {} on #{} edited (was: {})", note_id, card_id, old.render().replace('\n', " | "));
+            refresh_views(&ctx, Some(card_id));
+        }
+
+        Commands::Note {
+            action: Some(NoteAction::Rm { note_id, by }),
+            ..
+        } => {
+            let now = now_str();
+            let (card_id, old) = transaction(conn, || {
+                let (card_id, old) = notes::remove(conn, note_id, &now)?;
+                events::record(conn, card_id, None, "note_rm", &old.render(), "", by.as_deref().unwrap_or(""), &now)?;
+                Ok((card_id, old))
+            })?;
+            println!("note {} removed from #{}: {}", note_id, card_id, old.render().replace('\n', " | "));
+            refresh_views(&ctx, Some(card_id));
+        }
+
+        Commands::Note {
+            action: None,
             id,
             text,
+            stdin,
+            file,
             kind,
             by,
             commit,
             unique,
         } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
+            let id = id.ok_or_else(|| anyhow::anyhow!("usage: bl note <card-id> \"text\" (or bl note edit|rm <note-id>)"))?;
+            let text = if stdin {
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("failed to read stdin")?;
+                buf
+            } else if let Some(path) = &file {
+                std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
+            } else {
+                text.unwrap_or_default()
+            };
+            let text = text.trim_end().to_string();
+            if text.trim().is_empty() {
+                bail!("the note is empty");
+            }
             let now = now_str();
             let old_commits: String = conn
                 .query_row("SELECT commits FROM cards WHERE id = ?", params![id], |r| {
@@ -1203,7 +3024,7 @@ fn main() -> Result<()> {
 
             // A backlog outside a repository still deserves its note: warn and
             // keep going rather than losing what the agent wanted to record.
-            let linked = match commit.as_deref().map(|rev| resolve_commit(&path, rev)) {
+            let linked = match commit.as_deref().map(|rev| resolve_commit(&ctx, rev)) {
                 Some(Ok(pair)) => Some(pair),
                 Some(Err(e)) => {
                     eprintln!("bl: no commit linked ({})", e);
@@ -1213,7 +3034,7 @@ fn main() -> Result<()> {
             };
 
             let added = notes::add(
-                &conn,
+                conn,
                 id,
                 &kind,
                 by.as_deref().unwrap_or(""),
@@ -1239,20 +3060,18 @@ fn main() -> Result<()> {
                 }
                 None => println!("#{} [{}] note added", id, kind),
             }
-            refresh_views(&conn, &path);
+            refresh_views(&ctx, Some(id));
         }
 
         Commands::Notes { id, kind, json } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let exists: Option<i64> = conn
                 .query_row("SELECT id FROM cards WHERE id = ?", params![id], |r| r.get(0))
                 .optional()?;
             if exists.is_none() {
                 bail!("card #{} not found", id);
             }
-            notes::reconcile(&conn, id)?;
-            let all = notes::list(&conn, id)?;
+            notes::reconcile(conn, id)?;
+            let all = notes::list(conn, id)?;
             let shown: Vec<&Note> = all
                 .iter()
                 .filter(|n| kind.as_ref().map(|k| &n.kind == k).unwrap_or(true))
@@ -1273,7 +3092,7 @@ fn main() -> Result<()> {
                     } else {
                         format!("  {}", n.author)
                     };
-                    println!("[{}] {}{}", n.kind, n.created_at, who);
+                    println!("[{}] {}{}  (note {})", n.kind, n.created_at, who, n.id);
                     println!("    {}", n.body.replace('\n', "\n    "));
                     if !n.commit_sha.is_empty() {
                         println!("    commit: {} {}", n.commit_sha, n.commit_subject);
@@ -1289,13 +3108,15 @@ fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
-
             // Every word must appear somewhere on the card, so "hero art"
             // finds a card whose title says Hero and whose notes say art.
             let mut sql = format!("SELECT {} FROM cards WHERE 1=1", SELECT_COLS);
             let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+            let (scope, pid) = ctx.scope();
+            sql.push_str(&scope);
+            if let Some(pid) = pid {
+                binds.push(Box::new(pid));
+            }
             for term in &query {
                 sql.push_str(
                     " AND (lower(title) LIKE ?
@@ -1311,8 +3132,9 @@ fn main() -> Result<()> {
                 }
             }
             if let Some(l) = &label {
-                sql.push_str(" AND label = ?");
-                binds.push(Box::new(l.clone()));
+                let (clause, tag_binds) = tag_clause(l);
+                sql.push_str(&clause);
+                binds.extend(tag_binds);
             }
             if open {
                 sql.push_str(" AND status != 'done'");
@@ -1329,7 +3151,7 @@ fn main() -> Result<()> {
             };
 
             if json {
-                load_entries(&conn, &mut cards);
+                load_entries(conn, &mut cards);
                 println!("{}", serde_json::to_string_pretty(&cards)?);
                 if cards.is_empty() {
                     exit_with(EXIT_EMPTY);
@@ -1339,7 +3161,7 @@ fn main() -> Result<()> {
                 exit_with(EXIT_EMPTY);
             } else {
                 for c in &cards {
-                    print_card(c, false);
+                    print_card(c, false, multi);
                     for line in matching_lines(c, &query) {
                         println!("    match: {}", line);
                     }
@@ -1354,19 +3176,24 @@ fn main() -> Result<()> {
             dry_run,
         } => {
             let secs = parse_duration(&older_than)?;
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let cutoff = format!("-{} seconds", secs);
+            let (scope, pid) = ctx.scope();
 
             let stale: Vec<(i64, String, String)> = {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare(&format!(
                     "SELECT id, claimed_by, claimed_at FROM cards
                      WHERE status = 'in_progress'
                        AND claimed_at != ''
-                       AND claimed_at <= datetime('now', ?)
+                       AND claimed_at <= datetime('now', ?){}
                      ORDER BY id ASC",
-                )?;
-                let rows = stmt.query_map(params![cutoff], |r| {
+                    scope
+                ))?;
+                let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cutoff)];
+                if let Some(pid) = pid {
+                    binds.push(Box::new(pid));
+                }
+                let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
+                let rows = stmt.query_map(refs.as_slice(), |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })?;
                 let collected: Vec<(i64, String, String)> = rows.filter_map(|r| r.ok()).collect();
@@ -1384,14 +3211,18 @@ fn main() -> Result<()> {
                     println!("#{} would be released (claimed by {} at {})", id, who, since);
                     continue;
                 }
-                conn.execute(
+                let n = conn.execute(
                     "UPDATE cards
                      SET status = 'ready', claimed_by = '', claimed_at = '', updated_at = ?1
                      WHERE id = ?2 AND status = 'in_progress' AND claimed_at = ?3",
                     params![now, id, since],
                 )?;
+                if n == 1 {
+                    events::record(conn, *id, None, "status", "in_progress", "ready", "reap", &now)?;
+                    events::record(conn, *id, None, "reap", who, "", "reap", &now)?;
+                }
                 notes::add(
-                    &conn,
+                    conn,
                     *id,
                     "reaped",
                     "",
@@ -1403,13 +3234,11 @@ fn main() -> Result<()> {
                 println!("#{} released → ready (was {})", id, who);
             }
             if !dry_run {
-                refresh_views(&conn, &path);
+                refresh_views(&ctx, None);
             }
         }
 
         Commands::Heartbeat { id, by } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let now = now_str();
             let n = conn.execute(
                 "UPDATE cards SET claimed_at = ?1 WHERE id = ?2
@@ -1424,9 +3253,7 @@ fn main() -> Result<()> {
         }
 
         Commands::Prompt { out, append } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
-            let text = agent_prompt(&conn, &path)?;
+            let text = agent_prompt(&ctx)?;
             match out {
                 None => print!("{}", text),
                 Some(file) => {
@@ -1457,20 +3284,34 @@ fn main() -> Result<()> {
         }
 
         Commands::Auto { action } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
+            // Inside a project the setting is the project's; from outside
+            // (or with --all) it is the store-wide, every-project page.
+            let scoped = ctx.project.as_ref().filter(|_| !ctx.all);
+            let set = |target: &str| -> Result<()> {
+                match scoped {
+                    Some(p) => store::set_autoexport(conn, p.id, target),
+                    None => meta_set(conn, "autoexport", target),
+                }
+            };
             match action {
                 AutoAction::On { out } => {
                     let target = absolute(&out);
-                    meta_set(&conn, "autoexport", &target.display().to_string())?;
-                    view::refresh(&path, &target)?;
-                    println!("auto-export on → {}", target.display());
+                    set(&target.display().to_string())?;
+                    view::refresh(&ctx.path, scoped.map(|p| p.id), ctx.central, &target)?;
+                    println!(
+                        "auto-export on → {}{}",
+                        target.display(),
+                        match scoped {
+                            Some(p) => format!("  (project {})", p.name),
+                            None => String::new(),
+                        }
+                    );
                 }
                 AutoAction::Off => {
-                    meta_set(&conn, "autoexport", "")?;
+                    set("")?;
                     println!("auto-export off");
                 }
-                AutoAction::Status => match autoexport_target(&conn) {
+                AutoAction::Status => match autoexport_target(&ctx) {
                     Some(t) => println!("auto-export on → {}", t.display()),
                     None => println!("auto-export off"),
                 },
@@ -1478,18 +3319,19 @@ fn main() -> Result<()> {
         }
 
         Commands::Serve { port, also, open } => {
-            let sources = view_sources(&path, also)?;
+            let sources = view_sources(&ctx, also)?;
             view::serve(sources, port, open)?;
         }
 
         Commands::Export { out, open, auto } => {
-            let sources = view_sources(&path, Vec::new())?;
+            let sources = view_sources(&ctx, Vec::new())?;
             view::export(sources, &out)?;
             if auto {
-                let conn = open_db(&path)?;
-                ensure_schema(&conn)?;
                 let target = absolute(&out);
-                meta_set(&conn, "autoexport", &target.display().to_string())?;
+                match ctx.project.as_ref().filter(|_| !ctx.all) {
+                    Some(p) => store::set_autoexport(conn, p.id, &target.display().to_string())?,
+                    None => meta_set(conn, "autoexport", &target.display().to_string())?,
+                }
                 println!("auto-export on → {}", target.display());
             }
             if open {
@@ -1505,17 +3347,22 @@ fn main() -> Result<()> {
             watch,
             no_color,
         } => {
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
-            drop(conn);
+            let (project, title) = match (&ctx.project, ctx.all) {
+                (Some(p), false) => (Some(p.id), p.name.clone()),
+                _ => (None, ctx.path.display().to_string()),
+            };
             board::run(
-                &path,
+                &ctx.path,
+                project,
+                ctx.central,
+                &title,
                 &board::Opts {
                     label,
                     done,
                     width,
                     watch,
                     color: !no_color,
+                    show_project: multi,
                 },
             )?;
         }
@@ -1524,18 +3371,25 @@ fn main() -> Result<()> {
             if amount < 0 {
                 bail!("amount must be >= 0");
             }
-            let conn = open_db(&path)?;
-            ensure_schema(&conn)?;
             let now = now_str();
+            let (scope, pid) = ctx.scope();
+            let mut binds: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(amount), Box::new(now)];
+            if let Some(pid) = pid {
+                binds.push(Box::new(pid));
+            }
+            let refs: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|b| b.as_ref()).collect();
             let n = conn.execute(
-                "UPDATE cards
-                 SET priority = MAX(0, priority - ?1),
-                     updated_at = ?2
-                 WHERE status != 'done'",
-                params![amount, now],
+                &format!(
+                    "UPDATE cards
+                     SET priority = MAX(0, priority - ?1),
+                         updated_at = ?2
+                     WHERE status != 'done'{}",
+                    scope
+                ),
+                refs.as_slice(),
             )?;
             println!("decayed {} non-done card(s) by {}", n, amount);
-            refresh_views(&conn, &path);
+            refresh_views(&ctx, None);
         }
     }
 
