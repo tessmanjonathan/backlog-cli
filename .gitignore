@@ -5,3 +5,4 @@ backlog.db-shm
 backlog.db.*
 view/index.html.tmp
 view/index.html
+.claude/

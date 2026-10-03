@@ -127,7 +127,7 @@ even `bl delete` leave rows that `bl history <id>` replays. Pass `--by <you>` to
 | `bl heartbeat <id> --by <agent-id>` | Keep a long claim alive |
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl decay [--amount 25]` | Age everything down (scheduled, not per-task) |
-| `bl board`, `bl serve`, `bl export` | Human views — you rarely need these |
+| `bl open [CARD]`, `bl board`, `bl serve`, `bl export` | Human views — you rarely need these; `bl open --print <id>` gives a human the link to a card |
 
 `--json` on `next`, `show`, `list`, `search`, `notes` and `history` is the machine-readable
 form; prefer it when you are parsing rather than reading.

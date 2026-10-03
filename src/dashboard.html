@@ -20,6 +20,7 @@
 
     --accent:      #14655A;
     --accent-soft: #D6E6E1;
+    --mark:        #F6E7A6;
 
     /* Status semantics — separate from the accent */
     --s-new:      #64748B;
@@ -37,9 +38,13 @@
     --heat-cold: #7C93A0;
     --heat-hot:  #B8452F;
 
-    --radius: 3px;
+    --shadow: 0 1px 2px rgba(19, 26, 23, 0.06);
+    --shadow-2: 0 4px 14px rgba(19, 26, 23, 0.10);
+
+    --radius: 4px;
     --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --header-h: 96px;
   }
 
   @media (prefers-color-scheme: dark) {
@@ -55,6 +60,7 @@
 
       --accent:      #4FBFA9;
       --accent-soft: #14302A;
+      --mark:        #5A4A12;
 
       --s-new:      #93A4B5;
       --s-new-bg:   #1D262D;
@@ -69,6 +75,9 @@
 
       --heat-cold: #61818F;
       --heat-hot:  #E06A4E;
+
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+      --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.45);
     }
   }
 
@@ -84,6 +93,7 @@
 
     --accent:      #4FBFA9;
     --accent-soft: #14302A;
+    --mark:        #5A4A12;
 
     --s-new:      #93A4B5;
     --s-new-bg:   #1D262D;
@@ -98,6 +108,9 @@
 
     --heat-cold: #61818F;
     --heat-hot:  #E06A4E;
+
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-2: 0 6px 18px rgba(0, 0, 0, 0.45);
   }
 
   * { box-sizing: border-box; }
@@ -122,40 +135,85 @@
 
   .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 
-  button, select {
+  button, select, input {
     font: inherit;
     color: inherit;
     background: var(--surface);
     border: 1px solid var(--line);
     border-radius: var(--radius);
     padding: 5px 9px;
-    cursor: pointer;
   }
+  button, select { cursor: pointer; }
   button:hover, select:hover { border-color: var(--accent); }
+  button.quiet {
+    background: transparent;
+    border-color: transparent;
+    color: var(--ink-3);
+  }
+  button.quiet:hover { color: var(--accent); border-color: var(--line); }
+  button.quiet[aria-pressed="true"] { color: var(--accent); background: var(--accent-soft); border-color: transparent; }
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  mark { background: var(--mark); color: inherit; border-radius: 2px; padding: 0 1px; }
+  kbd {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-3);
+    border: 1px solid var(--line);
+    border-bottom-width: 2px;
+    border-radius: 3px;
+    padding: 0 5px;
+    line-height: 1.5;
+    background: var(--surface-2);
+  }
 
   /* ---------- header ---------- */
 
   header {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-    flex-wrap: wrap;
-    padding: 14px 22px;
-    background: var(--surface);
-    border-bottom: 1px solid var(--line);
     position: sticky;
     top: 0;
     z-index: 20;
+    background: var(--surface);
+    border-bottom: 1px solid var(--line);
   }
+  .bar, .tools {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 10px 22px;
+  }
+  .bar { padding-bottom: 6px; }
+  .tools { padding-top: 0; padding-bottom: 10px; gap: 8px 14px; }
 
   .wordmark {
     font-family: var(--mono);
     font-weight: 700;
     font-size: 17px;
     letter-spacing: -0.02em;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+    white-space: nowrap;
   }
-  .wordmark span { color: var(--accent); }
+  .wordmark .slash { color: var(--accent); }
+  .wordmark .scope { color: var(--accent); font-weight: 600; }
+  .wordmark .scope[hidden] { display: none; }
+  #projectpick {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: 15px;
+    color: var(--accent);
+    padding: 2px 6px;
+    border-color: transparent;
+    background: transparent;
+    max-width: 40ch;
+  }
+  #projectpick:hover, #projectpick[aria-expanded="true"] { border-color: var(--line); }
+  #projectpick .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #projectpick .caret { font-size: 10px; color: var(--ink-3); }
 
   .dbpath {
     font-family: var(--mono);
@@ -177,7 +235,12 @@
     display: inline-flex;
     align-items: center;
     gap: 7px;
+    background: transparent;
+    border: 1px solid transparent;
+    cursor: default;
   }
+  .pulse.reload { cursor: pointer; }
+  .pulse.reload:hover { border-color: var(--line); color: var(--accent); }
   .pulse i {
     width: 6px; height: 6px; border-radius: 50%;
     background: var(--accent);
@@ -192,37 +255,90 @@
   }
   @media (prefers-reduced-motion: reduce) {
     .pulse.beat i { animation: none; }
+    .card, .card:hover { transition: none; transform: none; }
   }
+
+  /* ---------- toolbar ---------- */
+
+  .search {
+    position: relative;
+    flex: 1 1 260px;
+    max-width: 520px;
+    display: flex;
+    align-items: center;
+  }
+  .search input {
+    width: 100%;
+    padding: 6px 60px 6px 30px;
+    background: var(--surface-2);
+    border-color: var(--line-soft);
+  }
+  .search input:focus { background: var(--surface); border-color: var(--accent); outline: none; box-shadow: 0 0 0 2px var(--accent-soft); }
+  .search input::placeholder { color: var(--ink-3); }
+  .search svg {
+    position: absolute;
+    left: 9px;
+    width: 14px; height: 14px;
+    color: var(--ink-3);
+    pointer-events: none;
+  }
+  .search kbd { position: absolute; right: 8px; pointer-events: none; }
+  .search .clear {
+    position: absolute;
+    right: 32px;
+    padding: 0 5px;
+    line-height: 1.2;
+    font-size: 12px;
+  }
+  .search .clear[hidden] { display: none; }
+
+  .field {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .field select { padding: 5px 7px; font-size: 13px; }
+
+  .count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .count[hidden] { display: none; }
+  .count button { padding: 1px 7px; font-size: 11px; }
 
   /* ---------- summary strip ---------- */
 
-  main { padding: 20px 22px 40px; }
+  main { padding: 16px 22px 40px; }
 
   .strip {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(126px, 1fr));
     gap: 1px;
     background: var(--line-soft);
     border: 1px solid var(--line);
     border-radius: var(--radius);
     overflow: hidden;
-    margin-bottom: 20px;
+    margin-bottom: 14px;
   }
   .tile {
     background: var(--surface);
-    padding: 12px 14px 13px;
+    padding: 9px 13px 10px;
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
   }
   .tile .v {
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
-    font-size: 25px;
+    font-size: 21px;
     letter-spacing: -0.02em;
-    line-height: 1.05;
+    line-height: 1.1;
   }
-  .tile .sub { font-size: 11px; color: var(--ink-3); }
+  .tile .sub { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
   /* ---------- distributions ---------- */
 
@@ -230,8 +346,9 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
     gap: 14px;
-    margin-bottom: 22px;
+    margin-bottom: 18px;
   }
+  .panels[hidden] { display: none; }
   .panel {
     background: var(--surface);
     border: 1px solid var(--line);
@@ -269,6 +386,9 @@
     text-align: right;
     color: var(--ink-2);
   }
+  .bar-row.pick { cursor: pointer; }
+  .bar-row.pick:hover .name { color: var(--accent); }
+  .bar-row.on .name { color: var(--accent); font-weight: 600; }
 
   .hist {
     display: flex;
@@ -301,15 +421,21 @@
   }
   @media (max-width: 620px) {
     .board { grid-template-columns: 1fr; }
+    main { padding: 12px 16px 32px; }
+    .bar, .tools { padding-left: 16px; padding-right: 16px; }
   }
 
   .col-head {
     display: flex;
     align-items: baseline;
     gap: 8px;
-    padding: 0 2px 8px;
+    padding: 8px 2px 8px;
     border-bottom: 2px solid var(--col);
     margin-bottom: 10px;
+    position: sticky;
+    top: var(--header-h);
+    background: var(--paper);
+    z-index: 5;
   }
   .col-head .label { color: var(--col); }
   .col-head .n {
@@ -319,6 +445,7 @@
     color: var(--ink-3);
     margin-left: auto;
   }
+  .col-head .n b { color: var(--ink-2); font-weight: 600; }
 
   .stack { display: flex; flex-direction: column; gap: 8px; }
 
@@ -328,48 +455,105 @@
     border: 1px solid var(--line);
     border-radius: var(--radius);
     border-left: 3px solid var(--heat);
-    padding: 9px 11px 10px;
+    box-shadow: var(--shadow);
+    padding: 8px 11px 9px;
     cursor: pointer;
     text-align: left;
     width: 100%;
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    transition: border-color 0.12s ease, transform 0.12s ease;
+    gap: 5px;
+    color: inherit;
+    transition: box-shadow 0.12s ease, transform 0.12s ease;
   }
-  .card:hover { border-color: var(--line); border-left-color: var(--heat); transform: translateX(1px); }
+  .card:hover { box-shadow: var(--shadow-2); transform: translateY(-1px); border-color: var(--line); }
   .card:hover .title { color: var(--accent); }
-  .card[aria-current="true"] { box-shadow: inset 0 0 0 1px var(--accent); }
+  .card[aria-current="true"] { box-shadow: inset 0 0 0 1px var(--accent), var(--shadow); }
+  .card.done { opacity: 0.82; }
+  .card.done .title { color: var(--ink-2); }
 
   .card .top {
     display: flex;
     align-items: baseline;
     gap: 8px;
+    min-width: 0;
   }
   .card .id {
     font-family: var(--mono);
     font-size: 11px;
     color: var(--ink-3);
+    flex-shrink: 0;
   }
+  .card .proj {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--accent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .card .proj:hover { text-decoration: underline; }
   .card .pri {
     font-family: var(--mono);
     font-variant-numeric: tabular-nums;
     font-size: 11px;
-    font-weight: 600;
-    color: var(--heat);
+    color: var(--ink-2);
     margin-left: auto;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .card .pri i {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--heat);
+    display: inline-block;
   }
   .card .title {
     font-size: 13.5px;
-    line-height: 1.35;
+    line-height: 1.38;
     text-wrap: pretty;
+    overflow-wrap: anywhere;
+  }
+  .card .snippet {
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: var(--ink-2);
+    border-left: 2px solid var(--line);
+    padding-left: 7px;
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow-wrap: anywhere;
   }
   .card .meta {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 4px 6px;
     flex-wrap: wrap;
+    min-width: 0;
   }
+  .card .meta:empty { display: none; }
+
+  /* Tags read as quiet words, not badges; more than three fold into "+n". */
+  .tag {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--ink-3);
+    background: var(--surface-2);
+    border-radius: 3px;
+    padding: 0 5px;
+    line-height: 1.6;
+    max-width: 14ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tag:hover { color: var(--accent); background: var(--accent-soft); }
+  .tag.on { color: var(--accent); background: var(--accent-soft); }
+  .tag.more { max-width: none; }
 
   .chip {
     font-family: var(--mono);
@@ -380,21 +564,14 @@
     background: var(--surface-2);
     color: var(--ink-2);
     border: 1px solid var(--line-soft);
+    white-space: nowrap;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .chip.project {
-    background: var(--accent-soft);
-    color: var(--accent);
-    border-color: transparent;
-  }
-  .bar-row.pick { cursor: pointer; }
-  .bar-row.pick:hover .name { color: var(--accent); }
-  .chip.agent {
-    background: var(--s-prog-bg);
-    color: var(--s-prog);
-    border-color: transparent;
-  }
-  .chip.done { background: var(--s-done-bg); color: var(--s-done); border-color: transparent; }
-  .ago { font-size: 10.5px; color: var(--ink-3); margin-left: auto; }
+  .chip.agent { background: var(--s-prog-bg); color: var(--s-prog); border-color: transparent; }
+  .chip.block { background: var(--s-block-bg); color: var(--s-block); border-color: transparent; }
+  .ago { font-size: 10.5px; color: var(--ink-3); margin-left: auto; white-space: nowrap; }
 
   .empty {
     padding: 14px 2px;
@@ -408,7 +585,7 @@
   .rail {
     position: fixed;
     top: 0; right: 0; bottom: 0;
-    width: min(430px, 92vw);
+    width: min(460px, 94vw);
     background: var(--surface);
     border-left: 1px solid var(--line);
     padding: 20px 22px 40px;
@@ -417,25 +594,40 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    box-shadow: var(--shadow-2);
   }
   .rail[hidden] { display: none; }
   .rail .close { position: absolute; top: 14px; right: 16px; }
+  .rail .head { display: flex; align-items: center; gap: 8px; padding-right: 42px; }
   .rail h2 {
     margin: 0;
-    font-size: 19px;
+    font-size: 18px;
     line-height: 1.3;
     text-wrap: balance;
     padding-right: 42px;
+    overflow-wrap: anywhere;
+  }
+  .status {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 1px 7px;
+    border-radius: 999px;
+    color: var(--sc);
+    background: var(--sbg);
   }
   .kv {
     display: grid;
     grid-template-columns: 10ch 1fr;
     gap: 5px 12px;
     font-size: 12px;
+    margin: 0;
   }
   .kv dt { color: var(--ink-3); font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; padding-top: 2px; }
-  .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; }
-  .block h3 { margin: 0 0 6px; font: inherit; }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+  .block h3 { margin: 0 0 6px; font: inherit; display: flex; align-items: center; gap: 8px; }
+  .block h3 .copy { margin-left: auto; padding: 0 7px; font-size: 11px; }
   .block pre {
     margin: 0;
     white-space: pre-wrap;
@@ -448,6 +640,28 @@
     font-size: 13px;
     line-height: 1.5;
   }
+  .block pre.cli { font-family: var(--mono); font-size: 12px; }
+  .notes { display: flex; flex-direction: column; gap: 8px; }
+  .note {
+    background: var(--surface-2);
+    border: 1px solid var(--line-soft);
+    border-radius: var(--radius);
+    padding: 8px 11px 9px;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .note .who {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--ink-3);
+    margin-bottom: 3px;
+  }
+  .note .who b { color: var(--ink-2); font-weight: 600; }
+  .note .body { white-space: pre-wrap; word-break: break-word; }
+  .note .sha { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 4px; }
   .scrim {
     position: fixed;
     inset: 0;
@@ -467,27 +681,174 @@
     margin-bottom: 16px;
   }
   .banner[hidden] { display: none; }
+
+  /* ---------- projects menu ---------- */
+
+  .menuwrap { position: relative; }
+  .menuwrap[hidden] { display: none; }
+  #projectsbtn b { color: var(--s-prog); font-weight: 600; }
+  .menu {
+    position: absolute;
+    right: 0;
+    top: calc(100% + 6px);
+    width: min(340px, calc(100vw - 32px));
+    max-height: min(70vh, 560px);
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-2);
+    padding: 10px 0 8px;
+    z-index: 35;
+  }
+  .menu[hidden] { display: none; }
+  .menu .mhead {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 12px 8px;
+    border-bottom: 1px solid var(--line-soft);
+    margin-bottom: 4px;
+  }
+  .menu .mhead .label { margin-right: auto; }
+  .menu .mhead button { padding: 1px 7px; font-size: 11px; }
+  .menu label.row {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center;
+    gap: 9px;
+    padding: 4px 12px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .menu label.row:hover { background: var(--surface-2); }
+  .menu label.row input { margin: 0; accent-color: var(--accent); }
+  .menu label.row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .menu label.row.off .nm { color: var(--ink-3); text-decoration: line-through; }
+  .menu label.row .n { color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .menu .cli {
+    padding: 8px 12px 2px;
+    margin-top: 4px;
+    border-top: 1px solid var(--line-soft);
+    font-size: 11.5px;
+    color: var(--ink-2);
+  }
+  .menu .cli code { font-family: var(--mono); font-size: 11px; color: var(--ink); }
+  .menu .cli ul { margin: 4px 0 0; padding-left: 16px; }
+  .menu .mnote { padding: 6px 12px 0; font-size: 11px; color: var(--ink-3); }
+
+  /* The project switcher: a popover that always opens downward, where a
+     native <select> on macOS centres on the current option and runs off the
+     top of the window. */
+  .menu.pick { left: 0; right: auto; width: min(320px, calc(100vw - 32px)); padding: 8px 0 6px; }
+  .menu.pick input {
+    display: block;
+    width: calc(100% - 16px);
+    margin: 0 8px 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .menu.pick .opt {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 12px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .menu.pick .opt .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .menu.pick .opt .n { color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .menu.pick .opt:hover, .menu.pick .opt.active { background: var(--surface-2); }
+  .menu.pick .opt[aria-selected="true"] .nm { color: var(--accent); font-weight: 600; }
+  .menu.pick .opt.off .nm { color: var(--ink-3); }
+  .menu.pick .opt.all { border-bottom: 1px solid var(--line-soft); margin-bottom: 4px; padding-bottom: 7px; }
+  .menu.pick .none { padding: 6px 12px; font-size: 12px; color: var(--ink-3); }
+
+  .bar-row { position: relative; }
+  .bar-row .x {
+    position: absolute;
+    right: -6px;
+    padding: 0 5px;
+    font-size: 11px;
+    line-height: 1.3;
+    opacity: 0;
+  }
+  .bar-row:hover .x, .bar-row .x:focus-visible { opacity: 1; }
+  .bar-row:hover .n { visibility: hidden; }
+
+  .help {
+    position: fixed;
+    left: 50%; top: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-2);
+    padding: 18px 22px;
+    z-index: 40;
+    min-width: 280px;
+  }
+  .help[hidden] { display: none; }
+  .help h3 { margin: 0 0 10px; font: inherit; }
+  .help dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 13px; align-items: center; }
+  .help dd { margin: 0; color: var(--ink-2); }
 </style>
 </head>
 <body>
 
-<header>
-  <div class="wordmark">bl<span>/</span>board</div>
-  <select id="dbpick" aria-label="Database"></select>
-  <select id="projectpick" aria-label="Project" hidden></select>
-  <div class="dbpath" id="dbpath" title=""></div>
-  <div class="spacer"></div>
-  <label class="label" for="labelpick">tag</label>
-  <select id="labelpick" aria-label="Filter by label"><option value="">all</option></select>
-  <label class="label" for="donepick">done</label>
-  <select id="donepick" aria-label="Done cards shown">
-    <option value="20">last 20</option>
-    <option value="60">last 60</option>
-    <option value="0">hide</option>
-    <option value="99999">all</option>
-  </select>
-  <div class="pulse label" id="pulse"><i></i><span id="pulsetext">live</span></div>
-  <button id="themetoggle" title="Toggle light / dark">◐</button>
+<header id="header">
+  <div class="bar">
+    <div class="wordmark">bl<span class="slash">/</span><span class="scope" id="scope">board</span></div>
+    <div class="menuwrap" id="projectpickwrap" hidden>
+      <button id="projectpick" aria-haspopup="listbox" aria-expanded="false" title="Switch project (g)"><span class="nm" id="projectpicklabel">all projects</span><span class="caret">▾</span></button>
+      <div class="menu pick" id="projectpickmenu" hidden>
+        <input id="projectfilter" type="text" placeholder="Filter projects…" autocomplete="off" spellcheck="false" aria-label="Filter projects" aria-controls="projectlist" />
+        <div id="projectlist" role="listbox" aria-label="Project"></div>
+      </div>
+    </div>
+    <select id="dbpick" aria-label="Database"></select>
+    <div class="dbpath" id="dbpath" title=""></div>
+    <div class="spacer"></div>
+    <button class="pulse label" id="pulse" title=""><i></i><span id="pulsetext">live</span></button>
+    <button class="quiet" id="helptoggle" title="Keyboard shortcuts (?)">?</button>
+    <button class="quiet" id="themetoggle" title="Toggle light / dark">◐</button>
+  </div>
+  <div class="tools">
+    <div class="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="q" type="search" placeholder="Search title, notes, tags, #id…" autocomplete="off" spellcheck="false" aria-label="Search cards" />
+      <button class="clear quiet" id="qclear" hidden aria-label="Clear search">✕</button>
+      <kbd>/</kbd>
+    </div>
+    <label class="field"><span class="label">tag</span>
+      <select id="labelpick" aria-label="Filter by tag"><option value="">all</option></select>
+    </label>
+    <label class="field"><span class="label">sort</span>
+      <select id="sortpick" aria-label="Sort cards">
+        <option value="priority">priority</option>
+        <option value="updated">recently updated</option>
+        <option value="created">newest</option>
+      </select>
+    </label>
+    <label class="field"><span class="label">done</span>
+      <select id="donepick" aria-label="Done cards shown">
+        <option value="20">last 20</option>
+        <option value="60">last 60</option>
+        <option value="0">hide</option>
+        <option value="99999">all</option>
+      </select>
+    </label>
+    <span class="count" id="count" hidden></span>
+    <div class="spacer"></div>
+    <div class="menuwrap" id="projectswrap" hidden>
+      <button class="quiet" id="projectsbtn" aria-haspopup="true" aria-expanded="false" title="Choose which projects this page shows (p)">projects</button>
+      <div class="menu" id="projectsmenu" hidden role="dialog" aria-label="Projects shown"></div>
+    </div>
+    <button class="quiet" id="chartstoggle" aria-pressed="false" title="Show or hide the charts (c)">charts</button>
+  </div>
 </header>
 
 <main>
@@ -495,7 +856,7 @@
 
   <section class="strip" id="strip" aria-label="Summary"></section>
 
-  <div class="panels">
+  <div class="panels" id="panels" hidden>
     <section class="panel" id="projectpanel" hidden>
       <h2 class="label">Open cards by project</h2>
       <div class="bars" id="projectbars"></div>
@@ -518,6 +879,19 @@
 
 <div class="scrim" id="scrim" hidden></div>
 <aside class="rail" id="rail" hidden aria-label="Card detail"></aside>
+<div class="help" id="help" hidden role="dialog" aria-label="Keyboard shortcuts">
+  <h3 class="label">Keyboard</h3>
+  <dl>
+    <dt><kbd>/</kbd></dt><dd>search</dd>
+    <dt><kbd>Enter</kbd></dt><dd>open the first match</dd>
+    <dt><kbd>Esc</kbd></dt><dd>close the card, then clear the search</dd>
+    <dt><kbd>c</kbd></dt><dd>show or hide the charts</dd>
+    <dt><kbd>g</kbd></dt><dd>switch project</dd>
+    <dt><kbd>p</kbd></dt><dd>choose which projects are shown</dd>
+    <dt><kbd>r</kbd></dt><dd>reload a file:// snapshot</dd>
+    <dt><kbd>?</kbd></dt><dd>this help</dd>
+  </dl>
+</div>
 
 <script id="bldata" type="application/json">null</script>
 <script>
@@ -541,16 +915,30 @@
     { key: "blocked",     name: "Blocked",     color: "var(--s-block)", optional: true },
     { key: "done",        name: "Done",        color: "var(--s-done)" },
   ];
+  const STATUS_VAR = { new: "new", ready: "ready", in_progress: "prog", blocked: "block", done: "done" };
 
   const $ = (id) => document.getElementById(id);
-  const state = { cards: [], db: 0, label: "", doneLimit: 20, selected: null,
-                  project: "", projects: [], scoped: null };
+  const store = {
+    get: (k, d) => { try { const v = localStorage.getItem("bl." + k); return v === null ? d : v; } catch (e) { return d; } },
+    set: (k, v) => { try { localStorage.setItem("bl." + k, v); } catch (e) {} },
+  };
+  const state = { cards: [], db: 0, label: "", q: "", sort: store.get("sort", "priority"),
+                  doneLimit: Number(store.get("done", "20")) || 0, selected: null,
+                  project: "", projects: [], scoped: null, charts: store.get("charts", "0") === "1",
+                  hiddenCli: [], hidden: new Set() };
+  // Projects this viewer has hidden on the store-wide page (by name). The
+  // durable, every-browser version is `bl project hide`, which leaves the
+  // cards out of the page altogether.
+  try { state.hidden = new Set(JSON.parse(store.get("hiddenProjects", "[]"))); } catch (e) {}
+  const saveHidden = () => store.set("hiddenProjects", JSON.stringify([...state.hidden].sort()));
 
-  // The project filter lives in the query string so a link keeps it, and in
-  // localStorage so the page reopens where it was left.
+  // The filters live in the query string so a link keeps them; the project
+  // also in localStorage so the page reopens where it was left.
   const params = new URLSearchParams(location.search);
   if (params.has("project")) state.project = params.get("project");
-  else { try { state.project = localStorage.getItem("bl.project") || ""; } catch (e) {} }
+  else state.project = store.get("project", "");
+  state.q = params.get("q") || "";
+  state.label = params.get("tag") || "";
 
   // --- helpers -------------------------------------------------------------
 
@@ -564,15 +952,14 @@
     return isNaN(d) ? null : d;
   };
 
-  const ago = (s) => {
-    const d = parseTs(s);
-    if (!d) return "";
-    const secs = Math.max(0, (Date.now() - d.getTime()) / 1000);
+  const agoMs = (ms) => {
+    const secs = Math.max(0, ms / 1000);
     if (secs < 90) return Math.round(secs) + "s ago";
     if (secs < 5400) return Math.round(secs / 60) + "m ago";
     if (secs < 172800) return Math.round(secs / 3600) + "h ago";
     return Math.round(secs / 86400) + "d ago";
   };
+  const ago = (s) => { const d = parseTs(s); return d ? agoMs(Date.now() - d.getTime()) : ""; };
 
   const full = (s) => {
     const d = parseTs(s);
@@ -585,22 +972,78 @@
     return `color-mix(in oklab, var(--heat-hot) ${Math.round(t * 100)}%, var(--heat-cold))`;
   };
 
-  // Cards of the chosen project (or all), before the label filter.
+  // Cards of the chosen project (or all), before the tag and search filters.
+  // Hidden projects drop out of the all-projects view; picking one by name
+  // (the header menu, a card link) still shows it.
+  const shown = () => state.hidden.size && !state.scoped
+    ? state.cards.filter((c) => !state.hidden.has(c.project)) : state.cards;
   const inProject = () =>
-    state.project ? state.cards.filter((c) => c.project === state.project) : state.cards;
+    state.project ? state.cards.filter((c) => c.project === state.project) : shown();
+  const projectNames = () => [...new Set(state.cards.map((c) => c.project).filter(Boolean))].sort();
 
   // A label is a comma-separated tag list; the filter matches any one tag.
   const tagsOf = (label) => String(label || "").split(",").map((t) => t.trim()).filter(Boolean);
 
+  // Search: every word must appear somewhere on the card — title, notes,
+  // outcome, tags, id, who holds it, what it waits on.
+  const terms = () => state.q.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const hay = (c) => c._hay || (c._hay = [
+    "#" + c.id, c.title, c.label, c.notes, c.outcome, c.claimed_by, c.blocked_on, c.project, c.status,
+    ...(c.entries || []).map((n) => n.body + " " + (n.author || "")),
+  ].map((x) => String(x || "")).join("\n").toLowerCase());
+  const matches = (c, ts) => ts.every((t) => hay(c).includes(t));
+
+  const filtering = () => !!(state.q.trim() || state.label);
+
   const visible = () => {
     let cards = inProject();
     if (state.label) cards = cards.filter((c) => tagsOf(c.label).includes(state.label));
+    const ts = terms();
+    if (ts.length) cards = cards.filter((c) => matches(c, ts));
     return cards;
+  };
+
+  // Wrap every search hit in <mark>; escapes as it goes.
+  const hl = (s, ts) => {
+    s = String(s ?? "");
+    if (!ts.length) return esc(s);
+    const re = new RegExp(ts.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "gi");
+    let out = "", last = 0, m;
+    while ((m = re.exec(s))) {
+      if (!m[0]) { re.lastIndex++; continue; }
+      out += esc(s.slice(last, m.index)) + "<mark>" + esc(m[0]) + "</mark>";
+      last = m.index + m[0].length;
+    }
+    return out + esc(s.slice(last));
+  };
+
+  // When the title alone doesn't explain a hit, show the note line that does.
+  const snippet = (c, ts) => {
+    if (!ts.length) return "";
+    const title = c.title.toLowerCase();
+    if (ts.every((t) => title.includes(t))) return "";
+    const lines = [
+      ...(c.entries || []).map((n) => n.body),
+      c.notes || "", c.outcome || "",
+    ].join("\n").split("\n");
+    const line = lines.find((l) => { const low = l.toLowerCase(); return ts.some((t) => low.includes(t)); });
+    if (!line) return "";
+    const low = line.toLowerCase();
+    const at = Math.min(...ts.map((t) => low.indexOf(t)).filter((i) => i >= 0));
+    const start = Math.max(0, at - 18);
+    const cut = (start > 0 ? "…" : "") + line.slice(start, start + 160).trim();
+    return `<div class="snippet" title="${esc(line)}">${hl(cut, ts)}</div>`;
   };
 
   // More than one project on screen: name it on every card.
   const spanning = () => !state.project && !state.scoped &&
-    new Set(state.cards.map((c) => c.project).filter(Boolean)).size > 1;
+    new Set(shown().map((c) => c.project).filter(Boolean)).size > 1;
+
+  const sorters = {
+    priority: (a, b) => b.priority - a.priority || String(a.created_at).localeCompare(String(b.created_at)),
+    updated:  (a, b) => String(b.updated_at).localeCompare(String(a.updated_at)),
+    created:  (a, b) => String(b.created_at).localeCompare(String(a.created_at)) || b.id - a.id,
+  };
 
   // --- rendering -----------------------------------------------------------
 
@@ -612,7 +1055,8 @@
     const avg = open.length
       ? Math.round(open.reduce((a, c) => a + c.priority, 0) / open.length)
       : 0;
-    const top = open.reduce((a, c) => (a && a.priority >= c.priority ? a : c), null);
+    const top = open.filter((c) => c.status !== "blocked")
+      .reduce((a, c) => (a && a.priority >= c.priority ? a : c), null);
     const dayAgo = Date.now() - 86400000;
     const done24 = done.filter((c) => {
       const d = parseTs(c.updated_at);
@@ -622,19 +1066,20 @@
       const d = parseTs(c.updated_at);
       return d && d.getTime() < a ? d.getTime() : a;
     }, Date.now());
+    const blocked = cards.filter((c) => c.status === "blocked").length;
 
     const tiles = [
       ["Open", open.length, `${cards.filter((c) => c.status === "new").length} new · ${cards.filter((c) => c.status === "ready").length} ready${
-        cards.some((c) => c.status === "blocked") ? ` · ${cards.filter((c) => c.status === "blocked").length} blocked` : ""}`],
+        blocked ? ` · ${blocked} blocked` : ""}`],
       ["In progress", prog.length, agents.size ? `${agents.size} agent${agents.size > 1 ? "s" : ""} holding` : "unclaimed"],
+      ["Top card", top ? "#" + top.id : "—", top ? `priority ${top.priority}` : "board clear", top ? top.id : null],
       ["Avg priority", avg, open.length ? "across open cards" : "nothing open"],
-      ["Top card", top ? "#" + top.id : "—", top ? `priority ${top.priority}` : "board clear"],
       ["Closed 24h", done24, `${done.length} done all time`],
-      ["Oldest open", open.length ? ago(new Date(stale).toISOString()) : "—", "last touched"],
+      ["Oldest open", open.length ? agoMs(Date.now() - stale) : "—", "last touched"],
     ];
 
-    $("strip").innerHTML = tiles.map(([k, v, sub]) => `
-      <div class="tile">
+    $("strip").innerHTML = tiles.map(([k, v, sub, goto]) => `
+      <div class="tile"${goto ? ` data-goto="${goto}" style="cursor:pointer" title="Open card #${goto}"` : ""}>
         <div class="label">${esc(k)}</div>
         <div class="v">${esc(v)}</div>
         <div class="sub">${esc(sub)}</div>
@@ -643,20 +1088,20 @@
 
   function renderProjectBars() {
     const panel = $("projectpanel");
-    const names = [...new Set(state.cards.map((c) => c.project).filter(Boolean))];
+    const names = [...new Set(shown().map((c) => c.project).filter(Boolean))];
     if (state.scoped || names.length < 2) { panel.hidden = true; return; }
     panel.hidden = false;
-    const open = state.cards.filter((c) => c.status !== "done");
+    const open = shown().filter((c) => c.status !== "done");
     const counts = new Map(names.map((n) => [n, 0]));
     for (const c of open) if (c.project) counts.set(c.project, counts.get(c.project) + 1);
     const rows = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
     const max = Math.max(1, ...rows.map((r) => r[1]));
     $("projectbars").innerHTML = rows.map(([name, n]) => `
-      <div class="bar-row pick" data-project="${esc(name)}" title="Show only ${esc(name)}"
-           style="${state.project === name ? "font-weight:600" : ""}">
+      <div class="bar-row pick ${state.project === name ? "on" : ""}" data-project="${esc(name)}" title="Show only ${esc(name)}">
         <div class="name">${esc(name)}</div>
         <div class="track"><div style="width:${(n / max) * 100}%;background:var(--accent)"></div></div>
         <div class="n">${n}</div>
+        <button class="x quiet" data-hide="${esc(name)}" title="Hide ${esc(name)} from this page" aria-label="Hide ${esc(name)}">hide</button>
       </div>`).join("");
   }
 
@@ -672,7 +1117,7 @@
 
     $("labelbars").innerHTML = rows.length
       ? rows.map(([name, n]) => `
-        <div class="bar-row">
+        <div class="bar-row ${name === "(none)" ? "" : "pick"} ${state.label === name ? "on" : ""}" data-tag="${esc(name)}" title="Show only ${esc(name)}">
           <div class="name" title="${esc(name)}">${esc(name)}</div>
           <div class="track"><div style="width:${(n / max) * 100}%;background:var(--accent)"></div></div>
           <div class="n">${n}</div>
@@ -693,62 +1138,81 @@
            title="${i * 500}–${i * 500 + 499}: ${n} card${n === 1 ? "" : "s"}"></div>`).join("");
   }
 
-  function cardHTML(c) {
+  function tagHTML(tags) {
+    const shown = tags.slice(0, 3);
+    const more = tags.length - shown.length;
+    return shown.map((t) =>
+      `<span class="tag ${state.label === t ? "on" : ""}" data-tag="${esc(t)}" title="Filter by ${esc(t)}">${esc(t)}</span>`).join("") +
+      (more > 0 ? `<span class="tag more" title="${esc(tags.slice(3).join(", "))}">+${more}</span>` : "");
+  }
+
+  function cardHTML(c, ts) {
     const agentChip = c.claimed_by
-      ? `<span class="chip agent">@${esc(c.claimed_by)}</span>` : "";
-    const labelChip = tagsOf(c.label).map((t) => `<span class="chip">${esc(t)}</span>`).join("");
+      ? `<span class="chip agent" title="claimed by ${esc(c.claimed_by)}">@${esc(c.claimed_by)}</span>` : "";
     const projectChip = spanning() && c.project
-      ? `<span class="chip project">${esc(c.project)}</span>` : "";
-    const outcomeChip = c.status === "done" && c.outcome
-      ? `<span class="chip done">outcome</span>` : "";
+      ? `<span class="proj" data-project="${esc(c.project)}" title="Show only ${esc(c.project)}">${esc(c.project)}</span>` : "";
     const blockedChip = c.status === "blocked" && c.blocked_on
-      ? `<span class="chip agent">on ${esc(c.blocked_on)}</span>` : "";
+      ? `<span class="chip block">on ${esc(c.blocked_on)}</span>` : "";
     const openBlockers = (c.links || []).filter((l) => l.rel === "blocked_by" && l.status !== "done");
     const waitChip = openBlockers.length
-      ? `<span class="chip agent" title="${esc(openBlockers.map((l) => "#" + l.id + " " + l.title).join("\n"))}">waits on ${
+      ? `<span class="chip block" title="${esc(openBlockers.map((l) => "#" + l.id + " " + l.title).join("\n"))}">waits on ${
           openBlockers.map((l) => "#" + l.id).join(" ")}</span>` : "";
     return `
-      <button class="card" data-id="${c.id}" style="--heat:${heat(c.priority)}"
+      <button class="card ${c.status === "done" ? "done" : ""}" data-id="${c.id}" style="--heat:${heat(c.priority)}"
               aria-current="${state.selected === c.id}">
         <div class="top">
           <span class="id">#${c.id}</span>
-          ${projectChip}${labelChip}${waitChip}
-          <span class="pri">${c.priority}</span>
+          ${projectChip}
+          <span class="pri" title="priority ${c.priority}"><i></i>${c.priority}</span>
         </div>
-        <div class="title">${esc(c.title)}</div>
+        <div class="title">${hl(c.title, ts)}</div>
+        ${snippet(c, ts)}
         <div class="meta">
-          ${agentChip}${blockedChip}${outcomeChip}
-          <span class="ago">${esc(ago(c.updated_at))}</span>
+          ${tagHTML(tagsOf(c.label))}${agentChip}${blockedChip}${waitChip}
+          <span class="ago" title="${esc(full(c.updated_at))}">${esc(ago(c.updated_at))}</span>
         </div>
       </button>`;
   }
 
   function renderBoard(cards) {
+    const ts = terms();
+    const all = inProject();
     // The blocked column appears only while something is parked there.
-    const cols = COLUMNS.filter((col) => !col.optional || cards.some((c) => c.status === col.key));
+    const cols = COLUMNS.filter((col) => !col.optional || all.some((c) => c.status === col.key));
     $("board").style.setProperty("--cols", cols.length);
     $("board").innerHTML = cols.map((col) => {
       let items = cards.filter((c) => c.status === col.key);
       const total = items.length;
+      const unfiltered = filtering() ? all.filter((c) => c.status === col.key).length : total;
       if (col.key === "done") {
-        items = [...items].sort((a, b) =>
-          String(b.updated_at).localeCompare(String(a.updated_at)));
+        items = [...items].sort(sorters.updated);
         items = items.slice(0, state.doneLimit);
+      } else {
+        items = [...items].sort(sorters[state.sort] || sorters.priority);
       }
       const hidden = total - items.length;
+      const n = filtering() && unfiltered !== total ? `<b>${total}</b> / ${unfiltered}` : `${total}`;
       return `
         <section style="--col:${col.color}">
           <div class="col-head">
             <span class="label">${col.name}</span>
-            <span class="n">${total}</span>
+            <span class="n">${n}</span>
           </div>
           <div class="stack">
-            ${items.map(cardHTML).join("") ||
-              `<div class="empty">Nothing here.</div>`}
+            ${items.map((c) => cardHTML(c, ts)).join("") ||
+              `<div class="empty">${filtering() ? "No matches." : "Nothing here."}</div>`}
             ${hidden > 0 ? `<div class="empty">${hidden} older hidden</div>` : ""}
           </div>
         </section>`;
     }).join("");
+  }
+
+  function noteHTML(n) {
+    return `<div class="note">
+      <div class="who"><b>${esc(n.kind)}</b><span>${esc(full(n.created_at))}</span>${n.author ? `<span>· ${esc(n.author)}</span>` : ""}</div>
+      <div class="body">${esc(n.body)}</div>
+      ${n.commit_sha ? `<div class="sha">↳ ${esc(n.commit_sha)}${n.commit_subject ? " " + esc(n.commit_subject) : ""}</div>` : ""}
+    </div>`;
   }
 
   function renderRail() {
@@ -759,36 +1223,37 @@
       scrim.hidden = true;
       return;
     }
-    const statusColor = { new: "--s-new", ready: "--s-ready", in_progress: "--s-prog", blocked: "--s-block", done: "--s-done" }[c.status] || "--s-new";
+    const sv = STATUS_VAR[c.status] || "new";
+    const cli = `bl show ${c.id}${state.central || !state.dbPath ? "" : ` --db ${state.dbPath}`}`;
     rail.innerHTML = `
-      <button class="close" id="railclose" aria-label="Close">✕</button>
+      <button class="close quiet" id="railclose" aria-label="Close">✕</button>
       <div>
-        <div class="label">Card #${c.id}</div>
+        <div class="head">
+          <span class="label">Card #${c.id}</span>
+          <span class="status" style="--sc:var(--s-${sv});--sbg:var(--s-${sv}-bg)">${esc(c.status.replace("_", " "))}</span>
+          ${c.project && (spanning() || !state.scoped) ? `<span class="label">${esc(c.project)}</span>` : ""}
+        </div>
         <h2>${esc(c.title)}</h2>
       </div>
       <dl class="kv">
         ${c.project ? `<dt>Project</dt><dd>${esc(c.project)}</dd>` : ""}
-        <dt>Status</dt><dd style="color:var(${statusColor})">${esc(c.status)}${c.blocked_on ? ` <span style="color:var(--ink-3)">on ${esc(c.blocked_on)}</span>` : ""}</dd>
+        ${c.blocked_on ? `<dt>Blocked on</dt><dd style="color:var(--s-block)">${esc(c.blocked_on)}</dd>` : ""}
         <dt>Priority</dt><dd style="color:${heat(c.priority)}">${c.priority}</dd>
-        <dt>Tags</dt><dd>${esc(tagsOf(c.label).join(", ") || "—")}</dd>
+        <dt>Tags</dt><dd>${tagsOf(c.label).length ? tagsOf(c.label).map((t) => `<span class="tag" data-tag="${esc(t)}">${esc(t)}</span>`).join(" ") : "—"}</dd>
         <dt>Claimed</dt><dd>${c.claimed_by ? esc("@" + c.claimed_by) + " · " + esc(full(c.claimed_at)) : "—"}</dd>
         ${c.legacy_id ? `<dt>Imported</dt><dd>was #${c.legacy_id} in the repo board</dd>` : ""}
         <dt>Created</dt><dd>${esc(full(c.created_at))}</dd>
         <dt>Updated</dt><dd>${esc(full(c.updated_at))} <span style="color:var(--ink-3)">(${esc(ago(c.updated_at))})</span></dd>
       </dl>
+      ${c.outcome ? `<div class="block"><h3 class="label">Outcome</h3><pre>${esc(c.outcome)}</pre></div>` : ""}
       ${(c.entries && c.entries.length)
-        ? `<div class="block"><h3 class="label">Notes</h3><pre>${c.entries.map((n) =>
-            `<b>[${esc(n.kind)}]</b> <span style="color:var(--ink-3)">${esc(n.created_at)}${
-              n.author ? " · " + esc(n.author) : ""}</span>\n${esc(n.body)}${
-              n.commit_sha ? `\n<span style="color:var(--ink-3)">↳ ${esc(n.commit_sha)}${
-                n.commit_subject ? " " + esc(n.commit_subject) : ""}</span>` : ""}`
-          ).join("\n\n")}</pre></div>`
+        ? `<div class="block"><h3 class="label">Notes <span style="color:var(--ink-3)">${c.entries.length}</span></h3><div class="notes">${
+            c.entries.map(noteHTML).join("")}</div></div>`
         : c.notes ? `<div class="block"><h3 class="label">Notes</h3><pre>${esc(c.notes)}</pre></div>` : ""}
-      ${commitLines(c).length ? `<div class="block"><h3 class="label">Commits</h3><pre>${
+      ${commitLines(c).length ? `<div class="block"><h3 class="label">Commits</h3><pre class="cli">${
         commitLines(c).map(([sha, subject]) =>
           `<b>${esc(sha)}</b>${subject ? "  " + esc(subject) : ""}`).join("\n")
       }</pre></div>` : ""}
-      ${c.outcome ? `<div class="block"><h3 class="label">Outcome</h3><pre>${esc(c.outcome)}</pre></div>` : ""}
       ${(c.links && c.links.length) ? `<div class="block"><h3 class="label">Links</h3><pre>${
         ["blocked_by", "blocks", "child_of", "parent_of", "related"].map((rel) => {
           const items = c.links.filter((l) => l.rel === rel);
@@ -798,7 +1263,7 @@
             `<a href="#card-${l.id}" data-goto="${l.id}">#${l.id}</a> <span style="color:var(--ink-3)">${esc(l.status)}</span> ${esc(l.title)}`
           ).join("\n" + " ".repeat(name.length + 2))}`;
         }).filter(Boolean).join("\n")}</pre></div>` : ""}
-      ${(c.events && c.events.length) ? `<div class="block"><h3 class="label">Timeline</h3><pre>${
+      ${(c.events && c.events.length) ? `<div class="block"><h3 class="label">Timeline</h3><pre class="cli">${
         c.events.map((e) => {
           const flat = (s) => { const f = String(s).replace(/\n/g, " | "); return f.length > 120 ? f.slice(0, 117) + "..." : f; };
           const change = e.before && e.after ? `${esc(flat(e.before))} → ${esc(flat(e.after))}`
@@ -807,12 +1272,17 @@
             e.by ? ` <span style="color:var(--ink-3)">· ${esc(e.by)}</span>` : ""}`;
         }).join("\n")}</pre></div>` : ""}
       <div class="block">
-        <h3 class="label">Inspect from the CLI</h3>
-        <pre>bl show ${c.id}${state.central || !state.dbPath ? "" : ` --db ${state.dbPath}`}</pre>
+        <h3 class="label">Inspect from the CLI <button class="copy quiet" id="copycli" title="Copy">copy</button></h3>
+        <pre class="cli" id="clihint">${esc(cli)}</pre>
       </div>`;
     rail.hidden = false;
     scrim.hidden = false;
     $("railclose").addEventListener("click", close);
+    $("copycli").addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(cli); $("copycli").textContent = "copied"; }
+      catch (e) { $("copycli").textContent = "select it"; }
+      setTimeout(() => { const b = $("copycli"); if (b) b.textContent = "copy"; }, 1400);
+    });
     rail.querySelectorAll("[data-goto]").forEach((a) =>
       a.addEventListener("click", (e) => { e.preventDefault(); select(Number(a.dataset.goto)); }));
   }
@@ -827,13 +1297,87 @@
 
   function close() { select(null); }
 
+  function renderCount(cards) {
+    const el = $("count");
+    if (!filtering()) { el.hidden = true; return; }
+    const total = inProject().length;
+    el.innerHTML = `${cards.length} of ${total} card${total === 1 ? "" : "s"} <button id="clearall" title="Clear search and tag">clear</button>`;
+    el.hidden = false;
+    $("clearall").addEventListener("click", () => { setQuery(""); setLabel(""); });
+  }
+
+  function renderProjectsMenu() {
+    const wrap = $("projectswrap");
+    const names = projectNames();
+    const cli = state.hiddenCli;
+    // Only the store-wide page spans projects; a project's own page has nothing to hide.
+    if (state.scoped || (names.length < 2 && !cli.length)) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    const off = names.filter((n) => state.hidden.has(n)).length;
+    $("projectsbtn").innerHTML = off || cli.length
+      ? `projects · <b>${off + cli.length} hidden</b>` : "projects";
+    const menu = $("projectsmenu");
+    if (menu.hidden) return;
+    const open = new Map();
+    for (const c of state.cards) if (c.status !== "done" && c.project) open.set(c.project, (open.get(c.project) || 0) + 1);
+    menu.innerHTML = `
+      <div class="mhead">
+        <span class="label">Shown on this page</span>
+        <button data-all="show">all</button><button data-all="hide">none</button>
+      </div>
+      ${names.map((n) => `
+        <label class="row ${state.hidden.has(n) ? "off" : ""}">
+          <input type="checkbox" data-toggle="${esc(n)}" ${state.hidden.has(n) ? "" : "checked"} />
+          <span class="nm" title="${esc(n)}">${esc(n)}</span>
+          <span class="n">${open.get(n) || 0} open</span>
+        </label>`).join("")}
+      <div class="mnote">Remembered in this browser only.</div>
+      ${cli.length ? `<div class="cli">Left off this page with <code>bl project hide</code>:
+        <ul>${cli.map((n) => `<li><code>${esc(n)}</code></li>`).join("")}</ul>
+        <div style="margin-top:4px">Bring one back with <code>bl project unhide NAME</code>.</div></div>` : ""}`;
+  }
+
+  function toggleProjectsMenu(force) {
+    const menu = $("projectsmenu");
+    const openIt = force === undefined ? menu.hidden : force;
+    menu.hidden = !openIt;
+    $("projectsbtn").setAttribute("aria-expanded", String(openIt));
+    if (openIt) toggleProjectPick(false);
+    renderProjectsMenu();
+  }
+
+  function setHidden(names, hide) {
+    for (const n of names) { if (hide) state.hidden.add(n); else state.hidden.delete(n); }
+    saveHidden();
+    // Hiding the project in focus drops back to all projects.
+    if (hide && names.includes(state.project)) { setProject(""); }
+    const sel = state.cards.find((c) => c.id === state.selected);
+    if (sel && !state.project && state.hidden.has(sel.project)) state.selected = null;
+    syncLabelPicker();
+    renderAll();
+  }
+
+  function renderTitle() {
+    const name = state.scoped ? state.scoped.name
+      : state.project ? state.project
+      : state.projects.length === 1 ? state.projects[0].name
+      : (state.projects.length > 1 || spanning()) ? "all projects" : "";
+    const scope = $("scope");
+    scope.textContent = name || "board";
+    scope.hidden = !$("projectpickwrap").hidden;
+    document.title = (name ? name + " · " : "") + "bl board";
+  }
+
   function renderAll() {
     const cards = visible();
+    renderTitle();
     renderProjectBars();
     renderStrip(cards);
     renderLabelBars(cards);
     renderHist(cards);
     renderBoard(cards);
+    renderCount(cards);
+    renderProjectsMenu();
     renderRail();
   }
 
@@ -843,39 +1387,91 @@
     const labels = [...new Set(inProject().flatMap((c) => tagsOf(c.label)))].sort();
     const pick = $("labelpick");
     const want = ["", ...labels].join("|");
-    if (pick.dataset.sig === want) return;
-    pick.dataset.sig = want;
-    pick.innerHTML = `<option value="">all</option>` +
-      labels.map((l) => `<option value="${esc(l)}">${esc(l)}</option>`).join("");
+    if (pick.dataset.sig !== want) {
+      pick.dataset.sig = want;
+      pick.innerHTML = `<option value="">all</option>` +
+        labels.map((l) => `<option value="${esc(l)}">${esc(l)}</option>`).join("");
+    }
     pick.value = labels.includes(state.label) ? state.label : "";
     state.label = pick.value;
   }
 
   function syncProjectPicker() {
-    const pick = $("projectpick");
-    const names = [...new Set(state.cards.map((c) => c.project).filter(Boolean))].sort();
+    const wrap = $("projectpickwrap");
+    const names = projectNames();
     if (state.scoped || names.length < 2) {
-      pick.hidden = true;
+      toggleProjectPick(false);
+      wrap.hidden = true;
       if (state.scoped) state.project = "";
       return;
     }
-    pick.hidden = false;
-    const want = ["", ...names].join("|");
-    if (pick.dataset.sig !== want) {
-      pick.dataset.sig = want;
-      pick.innerHTML = `<option value="">all projects</option>` +
-        names.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
-    }
+    wrap.hidden = false;
     if (state.project && !names.includes(state.project)) state.project = "";
-    pick.value = state.project;
+    $("projectpicklabel").textContent = state.project || "all projects";
+    renderProjectPick();
+  }
+
+  // The switcher's options, narrowed by its filter box. `active` is the row the
+  // arrow keys are on; null means "start on the current project".
+  const pickNav = { active: null, opts: [] };
+
+  function renderProjectPick() {
+    if ($("projectpickmenu").hidden) return;
+    const q = $("projectfilter").value.trim().toLowerCase();
+    const open = new Map();
+    for (const c of state.cards) if (c.status !== "done" && c.project) open.set(c.project, (open.get(c.project) || 0) + 1);
+    const allOpen = shown().filter((c) => c.status !== "done").length;
+    pickNav.opts = [
+      ...(q ? [] : [{ value: "", n: allOpen }]),
+      ...projectNames().filter((n) => n.toLowerCase().includes(q)).map((n) => ({ value: n, n: open.get(n) || 0 })),
+    ];
+    if (pickNav.active === null) pickNav.active = Math.max(0, pickNav.opts.findIndex((o) => o.value === state.project));
+    pickNav.active = Math.min(pickNav.active, pickNav.opts.length - 1);
+    const list = $("projectlist");
+    list.innerHTML = pickNav.opts.length ? pickNav.opts.map((o, i) => {
+      const off = o.value && state.hidden.has(o.value);
+      return `
+        <div class="opt ${o.value ? "" : "all"} ${off ? "off" : ""} ${i === pickNav.active ? "active" : ""}"
+             role="option" id="popt-${i}" data-pick="${esc(o.value)}" aria-selected="${o.value === state.project}">
+          <span class="nm" title="${esc(o.value || "all projects")}">${esc(o.value || "all projects")}</span>
+          <span class="n">${o.n} open${off ? " · hidden" : ""}</span>
+        </div>`;
+    }).join("") : `<div class="none">No project matches.</div>`;
+    const active = $("popt-" + pickNav.active);
+    $("projectfilter").setAttribute("aria-activedescendant", active ? active.id : "");
+    if (active) active.scrollIntoView({ block: "nearest" });
+  }
+
+  function toggleProjectPick(force) {
+    const menu = $("projectpickmenu");
+    const openIt = force === undefined ? menu.hidden : force;
+    if (openIt === !menu.hidden) return;
+    menu.hidden = !openIt;
+    $("projectpick").setAttribute("aria-expanded", String(openIt));
+    if (!openIt) return;
+    if (!$("projectsmenu").hidden) toggleProjectsMenu(false);
+    $("projectfilter").value = "";
+    pickNav.active = null;
+    renderProjectPick();
+    $("projectfilter").focus();
+  }
+
+  function chooseProject(name) {
+    toggleProjectPick(false);
+    $("projectpick").focus();
+    setProject(name);
+  }
+
+  function setParam(key, value) {
+    const url = new URL(location.href);
+    if (value) url.searchParams.set(key, value); else url.searchParams.delete(key);
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
   }
 
   function setProject(name) {
     state.project = name;
-    try { localStorage.setItem("bl.project", name); } catch (e) {}
-    const url = new URL(location.href);
-    if (name) url.searchParams.set("project", name); else url.searchParams.delete("project");
-    history.replaceState(null, "", url.pathname + url.search + url.hash);
+    store.set("project", name);
+    setParam("project", name);
     // A card from another project stays selected only if it is still on screen.
     const sel = state.cards.find((c) => c.id === state.selected);
     if (sel && name && sel.project !== name) state.selected = null;
@@ -884,20 +1480,47 @@
     renderAll();
   }
 
+  function setLabel(tag) {
+    state.label = tag;
+    setParam("tag", tag);
+    syncLabelPicker();
+    renderAll();
+  }
+
+  let qTimer = null;
+  function setQuery(q, { immediate = true } = {}) {
+    state.q = q;
+    $("q").value = q;
+    $("qclear").hidden = !q;
+    setParam("q", q.trim());
+    clearTimeout(qTimer);
+    if (immediate) renderAll(); else qTimer = setTimeout(renderAll, 60);
+  }
+
+  function setCharts(on) {
+    state.charts = on;
+    store.set("charts", on ? "1" : "0");
+    $("panels").hidden = !on;
+    $("chartstoggle").setAttribute("aria-pressed", String(on));
+  }
+
   function apply(data) {
     state.cards = data.cards;
     state.dbPath = data.db.path;
     state.central = !!data.db.central;
     state.projects = data.projects || [];
     state.scoped = data.project || null;
-    const where = state.scoped ? `${state.scoped.name} · ${data.db.path}` : data.db.path;
-    $("dbpath").innerHTML = `<bdi>${esc(where)}</bdi>`;
-    $("dbpath").title = where;
+    state.hiddenCli = data.hidden_projects || [];
+    $("dbpath").innerHTML = `<bdi>${esc(data.db.path)}</bdi>`;
+    $("dbpath").title = data.db.path;
 
     // A deep link into a project that is filtered out: follow the link.
     const linkedCard = state.cards.find((c) => c.id === state.selected);
     if (linkedCard && state.project && linkedCard.project !== state.project) {
       state.project = linkedCard.project || "";
+    }
+    if (linkedCard && !state.project && state.hidden.has(linkedCard.project)) {
+      state.project = linkedCard.project;
     }
 
     const pick = $("dbpick");
@@ -916,17 +1539,20 @@
     renderAll();
   }
 
+  function beat() {
+    const p = $("pulse");
+    p.classList.remove("beat");
+    void p.offsetWidth;
+    p.classList.add("beat");
+  }
+
   async function load() {
     try {
       const res = await fetch(`/api/cards?db=${state.db}`, { cache: "no-store" });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       apply(data);
-
-      const p = $("pulse");
-      p.classList.remove("beat");
-      void p.offsetWidth;
-      p.classList.add("beat");
+      beat();
       $("pulsetext").textContent = new Date().toLocaleTimeString();
     } catch (e) {
       const b = $("banner");
@@ -939,6 +1565,33 @@
   // --- wiring --------------------------------------------------------------
 
   document.addEventListener("click", (e) => {
+    const hide = e.target.closest("[data-hide]");
+    if (hide) { e.stopPropagation(); setHidden([hide.dataset.hide], true); return; }
+    const all = e.target.closest("[data-all]");
+    if (all) { setHidden(projectNames(), all.dataset.all === "hide"); syncProjectPicker(); return; }
+    if (e.target.closest("#projectpick")) { toggleProjectPick(); return; }
+    const opt = e.target.closest("[data-pick]");
+    if (opt) { chooseProject(opt.dataset.pick); return; }
+    if (!$("projectpickmenu").hidden && !e.target.closest("#projectpickwrap")) toggleProjectPick(false);
+    if (e.target.closest("#projectpickmenu")) return;
+    if (e.target.closest("#projectsbtn")) { toggleProjectsMenu(); return; }
+    if (!$("projectsmenu").hidden && !e.target.closest("#projectswrap")) toggleProjectsMenu(false);
+    if (e.target.closest("#projectsmenu")) return;
+    const tag = e.target.closest("[data-tag]");
+    if (tag && (tag.classList.contains("tag") || tag.classList.contains("pick"))) {
+      e.stopPropagation();
+      const t = tag.dataset.tag;
+      setLabel(state.label === t ? "" : t);
+      return;
+    }
+    const proj = e.target.closest("[data-project]");
+    if (proj) {
+      e.stopPropagation();
+      setProject(state.project === proj.dataset.project ? "" : proj.dataset.project);
+      return;
+    }
+    const goto = e.target.closest(".tile[data-goto]");
+    if (goto) { select(Number(goto.dataset.goto)); return; }
     const card = e.target.closest(".card");
     if (card) {
       const id = Number(card.dataset.id);
@@ -946,41 +1599,116 @@
     }
   });
 
+  $("projectsmenu").addEventListener("change", (e) => {
+    const t = e.target.closest("[data-toggle]");
+    if (!t) return;
+    setHidden([t.dataset.toggle], !t.checked);
+    syncProjectPicker();
+  });
+
   $("scrim").addEventListener("click", close);
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+  $("help").addEventListener("click", () => { $("help").hidden = true; });
+  $("helptoggle").addEventListener("click", () => { $("help").hidden = !$("help").hidden; });
+
+  document.addEventListener("keydown", (e) => {
+    const typing = e.target.matches("input, select, textarea");
+    if (e.key === "Escape") {
+      if (!$("help").hidden) { $("help").hidden = true; return; }
+      if (!$("projectsmenu").hidden) { toggleProjectsMenu(false); $("projectsbtn").focus(); return; }
+      if (state.selected !== null) { close(); return; }
+      if (typing && e.target.id === "q") { if (state.q) setQuery(""); else e.target.blur(); return; }
+      if (state.q) setQuery("");
+      return;
+    }
+    if (typing) {
+      if (e.key === "Enter" && e.target.id === "q") {
+        const first = visible().filter((c) => c.status !== "done")[0] || visible()[0];
+        if (first) select(first.id);
+      }
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === "/") { e.preventDefault(); $("q").focus(); $("q").select(); }
+    else if (e.key === "c") setCharts(!state.charts);
+    else if (e.key === "g" && !$("projectpickwrap").hidden) { e.preventDefault(); toggleProjectPick(); }
+    else if (e.key === "p" && !$("projectswrap").hidden) toggleProjectsMenu();
+    else if (e.key === "?") $("help").hidden = !$("help").hidden;
+    else if (e.key === "r" && SNAPSHOT && location.protocol === "file:") location.reload();
+  });
+
+  $("q").addEventListener("input", (e) => setQuery(e.target.value, { immediate: false }));
+  $("qclear").addEventListener("click", () => { setQuery(""); $("q").focus(); });
 
   $("dbpick").addEventListener("change", (e) => {
     state.db = Number(e.target.value);
     state.selected = null;
     load();
   });
-  $("projectpick").addEventListener("change", (e) => setProject(e.target.value));
-  document.addEventListener("click", (e) => {
-    const row = e.target.closest(".bar-row.pick");
-    if (row) setProject(state.project === row.dataset.project ? "" : row.dataset.project);
+  $("projectfilter").addEventListener("input", () => {
+    pickNav.active = $("projectfilter").value.trim() ? 0 : null;
+    renderProjectPick();
   });
-  $("labelpick").addEventListener("change", (e) => {
-    state.label = e.target.value;
-    renderAll();
+  $("projectfilter").addEventListener("keydown", (e) => {
+    const n = pickNav.opts.length;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (n) pickNav.active = (pickNav.active + (e.key === "ArrowDown" ? 1 : n - 1)) % n;
+      renderProjectPick();
+    } else if (e.key === "Enter") {
+      if (n) chooseProject(pickNav.opts[pickNav.active].value);
+    } else if (e.key === "Escape") {
+      toggleProjectPick(false);
+      $("projectpick").focus();
+    } else if (e.key === "Tab") {
+      toggleProjectPick(false);
+      return;
+    } else return;
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  $("labelpick").addEventListener("change", (e) => setLabel(e.target.value));
+  $("sortpick").addEventListener("change", (e) => {
+    state.sort = e.target.value;
+    store.set("sort", state.sort);
+    renderBoard(visible());
   });
   $("donepick").addEventListener("change", (e) => {
     state.doneLimit = Number(e.target.value);
+    store.set("done", String(state.doneLimit));
     renderBoard(visible());
   });
+  $("chartstoggle").addEventListener("click", () => setCharts(!state.charts));
 
   $("themetoggle").addEventListener("click", () => {
     const cur = document.documentElement.getAttribute("data-theme");
     const dark = cur ? cur === "dark"
       : window.matchMedia("(prefers-color-scheme: dark)").matches;
-    document.documentElement.setAttribute("data-theme", dark ? "light" : "dark");
+    const next = dark ? "light" : "dark";
+    document.documentElement.setAttribute("data-theme", next);
+    store.set("theme", next);
   });
+  { const t = store.get("theme", ""); if (t) document.documentElement.setAttribute("data-theme", t); }
+
+  // Column heads stick just under the header, whatever height it wraps to.
+  const fitHeader = () => document.documentElement.style.setProperty("--header-h", $("header").offsetHeight + "px");
+  new ResizeObserver(fitHeader).observe($("header"));
+  fitHeader();
+
+  // Initial control state from the URL and the remembered settings.
+  $("q").value = state.q;
+  $("qclear").hidden = !state.q;
+  $("sortpick").value = sorters[state.sort] ? state.sort : "priority";
+  state.sort = $("sortpick").value;
+  $("donepick").value = String(state.doneLimit);
+  if ($("donepick").value !== String(state.doneLimit)) { $("donepick").value = "20"; state.doneLimit = 20; }
+  setCharts(state.charts);
 
   const linked = /^#card-(\d+)$/.exec(location.hash);
   if (linked) state.selected = Number(linked[1]);
 
   // A snapshot is rewritten by every `bl` write when auto-export is on, so when
   // it is served over http it can stay current simply by re-reading itself.
-  // file:// can't fetch, so there it stays a true point-in-time snapshot.
+  // file:// can't fetch, so there it stays a point-in-time snapshot — the
+  // header says how old it is and a click (or `r`) reloads it.
   async function reloadSnapshot() {
     try {
       const res = await fetch(location.pathname + "?t=" + Date.now(), { cache: "no-store" });
@@ -991,10 +1719,7 @@
       if (!data) return;
       apply(data);
       $("pulsetext").textContent = data.generated_at + " UTC";
-      const p = $("pulse");
-      p.classList.remove("beat");
-      void p.offsetWidth;
-      p.classList.add("beat");
+      beat();
     } catch (e) {
       /* keep showing what we have */
     }
@@ -1002,8 +1727,17 @@
 
   if (SNAPSHOT) {
     const live = location.protocol !== "file:";
-    if (!live) document.getElementById("pulse").classList.add("frozen");
-    $("pulsetext").textContent = (live ? "" : "snapshot · ") + BOOT.generated_at + " UTC";
+    const p = $("pulse");
+    if (!live) {
+      p.classList.add("frozen", "reload");
+      p.title = "Snapshot written " + full(BOOT.generated_at) + ". Click or press r to reload.";
+      const age = () => { $("pulsetext").textContent = "snapshot · " + ago(BOOT.generated_at); };
+      age();
+      setInterval(age, 15000);
+      p.addEventListener("click", () => location.reload());
+    } else {
+      $("pulsetext").textContent = BOOT.generated_at + " UTC";
+    }
     apply(BOOT);
     if (live) setInterval(reloadSnapshot, 5000);
   } else {

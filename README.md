@@ -9,6 +9,7 @@ Single-binary SQLite backlog. Designed for autonomous agent loops.
 tar -xzf bl-cli.tar.gz
 cd backlog-cli
 cargo build --release
+cargo test                      # end-to-end tests in tests/cli.rs
 cp target/release/bl ~/bin/bl   # or /usr/local/bin/bl
 
 # once: create the central store under ~/.bl and register this repository
@@ -32,6 +33,8 @@ bl project list                    # every project, active flag, open card count
 bl project current                 # what this directory resolves to
 bl project deactivate experiments  # skipped by bl next, hidden from the default views
 bl project activate experiments
+bl project hide tinydungeons      # leave it off the store-wide board page only
+bl project unhide tinydungeons
 bl project remove old [--force]    # --force deletes its cards too
 ```
 
@@ -81,6 +84,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl init` | Create the central store and register this repository (`--db` for one file) |
 | `bl --version` | The bl version and the schema version stamped in the database it would open (read-only, migrates nothing) |
 | `bl project add\|list\|current\|activate\|deactivate\|remove` | Which repositories share the store |
+| `bl project hide\|unhide NAME...` | Leave projects off the store-wide board page; their own page, `bl next` and `bl list` are unaffected |
 | `bl import <backlog.db> [--project N] [--dry-run] [--json]` | Copy a repo-level board into the store |
 | `bl import --stdin [--if-absent] [--by who] [--dry-run]` | File many cards at once from a JSON array or JSON lines (`{"title", "label"?, "priority"?, "notes"?, "project"?}`); prints the ids as JSON |
 | `bl migrate [--scan DIR]... [--dry-run]` | Import every repo-level board it can find |
@@ -104,6 +108,7 @@ bl decay --amount 25   # run daily / on schedule
 | `bl reap [--older-than 30m] [--dry-run]` | Return claims from agents that died |
 | `bl decay [-a 25]` | Subtract priority from all non-done cards |
 | `bl board [-l tag] [-d 8] [--watch]` | Draw the board in the terminal |
+| `bl open [CARD\|PROJECT] [--print]` | Open this project's board in the browser (written fresh); a card id lands on that card, a project name opens that project's board |
 | `bl export [-o view/index.html] [--open] [--auto]` | Standalone HTML snapshot, no server |
 | `bl auto on\|off\|status [-o view/index.html]` | Keep a snapshot in sync after every write |
 | `bl prompt [-o FILE] [--append]` | Print agent instructions for *this* backlog |
@@ -258,6 +263,20 @@ The same board — summary tiles, open cards by tag, priority distribution, and 
 `new / ready / in_progress / done` columns (plus `blocked` while any card is parked) — in
 three deliveries.
 
+**Open it.** From anywhere inside a repository, one command finds the right board:
+
+```bash
+bl open              # this project's board, in the browser
+bl open 3055         # the board that card is on, with the card open
+bl open catgame      # another project's board
+bl open --print      # just the file:// URL (for an agent to hand you)
+bl --all open        # every active project on one page
+```
+
+The page is written fresh before it opens. A project that has no snapshot yet gets one
+under `~/.bl/view/<project>/index.html` and auto-export is switched on for it, so from
+then on the same file is always current. The browser tab is titled after the project.
+
 **Terminal.** No browser, no server:
 
 ```bash
@@ -287,6 +306,28 @@ bl --db ~/git/foo/backlog.db serve \
 In both HTML views, click a card for its notes, outcome, claim, links and timeline;
 `#card-12` in the URL deep-links to one card, and a card waiting on another wears a
 `waits on #N` chip.
+
+**Finding work on the page.** `/` focuses the search box; every word typed must appear
+somewhere on a card (title, notes, outcome, tags, `#id`, who holds it, what it waits on).
+Hits are highlighted, a card that matched only in its notes shows the matching line, and
+each column head reads `matched / total`. `Enter` opens the first match, `Esc` closes the
+card and then clears the search. Click a tag or a project name on any card to filter by
+it; the `sort` menu switches the open columns between priority, recently updated and
+newest. Search, tag and project live in the URL (`?q=shader&tag=spike&project=foo`) so a
+link keeps them. The charts are folded away by default (`c` or the `charts` button shows
+them); `?` lists the keys. A `file://` snapshot says how old it is in the header — click
+it or press `r` to reload after agents have written.
+
+**Hiding projects from the all-projects page.** Two ways, for two needs:
+
+- *For good, everywhere:* `bl project hide knightofoakhaven tinydungeons` leaves those
+  projects' cards out of the store-wide page altogether, so it also loads faster. Their own
+  pages, `bl open <name>`, `bl list` and `bl next` are untouched (to park a project from
+  agents too, `bl project deactivate` it). `bl project list` marks hidden projects and
+  `bl project unhide` brings one back.
+- *Quickly, in this browser:* the `projects` menu in the toolbar (or `p`) has a checkbox
+  per project, and each row of the "Open cards by project" chart has a `hide` button on
+  hover. Remembered in the browser only; the menu also lists what `bl project hide` left out.
 
 Read-only by design: databases are opened `SQLITE_OPEN_READ_ONLY`, only the paths given on
 the command line are reachable, and the server binds `127.0.0.1` only. Use the CLI to make

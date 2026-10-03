@@ -203,6 +203,44 @@ pub(crate) fn set_active(conn: &Connection, id: i64, active: bool) -> Result<()>
     Ok(())
 }
 
+/// Projects left off the store-wide board page: a comma list of project ids
+/// in `meta`, so no schema change and older builds simply ignore it. Reads
+/// never fail: a database without the key (or the table) hides nothing.
+const BOARD_HIDDEN_KEY: &str = "board_hidden";
+
+pub(crate) fn board_hidden(conn: &Connection) -> Vec<i64> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?",
+        params![BOARD_HIDDEN_KEY],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Hide or show one project on the store-wide page. Returns false when it was
+/// already in that state.
+pub(crate) fn set_board_hidden(conn: &Connection, id: i64, hidden: bool) -> Result<bool> {
+    let mut ids = board_hidden(conn);
+    if ids.contains(&id) == hidden {
+        return Ok(false);
+    }
+    if hidden {
+        ids.push(id);
+    } else {
+        ids.retain(|x| *x != id);
+    }
+    ids.sort_unstable();
+    let value = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![BOARD_HIDDEN_KEY, value],
+    )?;
+    Ok(true)
+}
+
 pub(crate) fn set_autoexport(conn: &Connection, id: i64, target: &str) -> Result<()> {
     conn.execute(
         "UPDATE projects SET autoexport = ?1 WHERE id = ?2",
