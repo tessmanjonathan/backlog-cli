@@ -44,6 +44,8 @@ struct ProjectRef {
     name: String,
     active: bool,
     path: String,
+    /// Left off the store-wide page by `bl project hide`.
+    hidden: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -55,6 +57,8 @@ struct Feed {
     project: Option<ProjectRef>,
     /// Every project in the database, so the page can offer a selector.
     projects: Vec<ProjectRef>,
+    /// Projects whose cards this feed leaves out (`bl project hide`), by name.
+    hidden_projects: Vec<String>,
     cards: Vec<Card>,
 }
 
@@ -280,13 +284,26 @@ fn feed(sources: &[Source], idx: usize) -> Result<Feed> {
     let project = src
         .project
         .and_then(|id| projects.iter().find(|p| p.id == id).cloned());
+    // Hiding applies only to the store-wide page; a project's own page (and
+    // an --also file, shown whole) always carries its cards.
+    let exclude: Vec<i64> = if src.project.is_none() && src.active_only {
+        projects.iter().filter(|p| p.hidden).map(|p| p.id).collect()
+    } else {
+        Vec::new()
+    };
+    let hidden_projects = projects
+        .iter()
+        .filter(|p| exclude.contains(&p.id))
+        .map(|p| p.name.clone())
+        .collect();
     let feed = Feed {
         db: dbref(idx, src),
         databases: sources.iter().enumerate().map(|(i, s)| dbref(i, s)).collect(),
         generated_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         project,
         projects,
-        cards: read_cards(&src.path, src.project, src.active_only)?,
+        hidden_projects,
+        cards: read_cards_excluding(&src.path, src.project, src.active_only, &exclude)?,
     };
     Ok(feed)
 }
@@ -309,13 +326,16 @@ fn read_projects(path: &Path) -> Result<Vec<ProjectRef>> {
     if !has {
         return Ok(Vec::new());
     }
+    let hidden = crate::store::board_hidden(&conn);
     let mut stmt = conn.prepare("SELECT id, name, active, path FROM projects ORDER BY name")?;
     let rows = stmt.query_map([], |r| {
+        let id: i64 = r.get(0)?;
         Ok(ProjectRef {
-            id: r.get(0)?,
+            id,
             name: r.get(1)?,
             active: r.get::<_, i64>(2)? != 0,
             path: r.get(3)?,
+            hidden: hidden.contains(&id),
         })
     })?;
     let mut out = Vec::new();
@@ -328,6 +348,17 @@ fn read_projects(path: &Path) -> Result<Vec<ProjectRef>> {
 /// Reads every card in scope, highest priority first. Opened read-only: the
 /// board and the snapshot never write to a backlog.
 pub fn read_cards(path: &Path, project: Option<i64>, active_only: bool) -> Result<Vec<Card>> {
+    read_cards_excluding(path, project, active_only, &[])
+}
+
+/// `read_cards`, leaving out the given projects when no single project is
+/// asked for (the store-wide page minus `bl project hide`).
+fn read_cards_excluding(
+    path: &Path,
+    project: Option<i64>,
+    active_only: bool,
+    exclude: &[i64],
+) -> Result<Vec<Card>> {
     let conn = Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -387,6 +418,10 @@ pub fn read_cards(path: &Path, project: Option<i64>, active_only: bool) -> Resul
                 sql.push_str(" AND project_id IN (SELECT id FROM projects WHERE active = 1)");
             }
             None => {}
+        }
+        if project.is_none() && !exclude.is_empty() {
+            let ids = exclude.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+            sql.push_str(&format!(" AND project_id NOT IN ({ids})"));
         }
     }
     sql.push_str(" ORDER BY priority DESC, created_at ASC");

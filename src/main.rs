@@ -575,6 +575,16 @@ enum Commands {
         auto: bool,
     },
 
+    /// Open this project's board in the browser (the self-refreshing snapshot, written now)
+    Open {
+        /// A card id to land on, or another project's name to open instead
+        #[arg(value_name = "CARD|PROJECT")]
+        what: Option<String>,
+        /// Print the location instead of launching a browser
+        #[arg(long)]
+        print: bool,
+    },
+
     /// Draw the board in the terminal
     Board {
         #[arg(short, long)]
@@ -634,6 +644,16 @@ enum ProjectAction {
     Activate { name: String },
     /// Park a project: skipped by `bl next`, hidden from the default views
     Deactivate { name: String },
+    /// Leave projects off the store-wide board page (their own page, `bl next` and `bl list` are unaffected)
+    Hide {
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
+    },
+    /// Put hidden projects back on the store-wide board page
+    Unhide {
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
+    },
     /// Drop a project row. Refuses while it still has cards unless --force.
     Remove {
         name: String,
@@ -1346,6 +1366,81 @@ fn refresh_views(ctx: &Ctx, card: Option<i64>) {
     for (out, project) in stale_snapshots(ctx, card) {
         if let Err(e) = view::refresh(&ctx.path, project, ctx.central, &out) {
             eprintln!("bl: auto-export to {} failed: {}", out.display(), e);
+        }
+    }
+}
+
+/// `bl project hide` / `unhide`: every name is resolved before anything
+/// changes, so a typo in the middle of a list leaves the setting as it was.
+fn set_board_hidden(ctx: &Ctx, names: &[String], hide: bool) -> Result<()> {
+    let mut found = Vec::new();
+    for name in names {
+        found.push(
+            store::lookup(&ctx.conn, name)?
+                .ok_or_else(|| anyhow::anyhow!("no project named '{}' (bl project list)", name))?,
+        );
+    }
+    for p in &found {
+        let changed = store::set_board_hidden(&ctx.conn, p.id, hide)?;
+        println!(
+            "{} '{}' {} the store-wide board",
+            if changed { "project" } else { "project already" },
+            p.name,
+            if hide { "hidden from" } else { "shown on" }
+        );
+    }
+    refresh_store_page(ctx);
+    Ok(())
+}
+
+/// Redraw only the store-wide page, after a change that affects nothing else.
+fn refresh_store_page(ctx: &Ctx) {
+    if env::var_os("BL_NO_AUTOEXPORT").is_some() {
+        return;
+    }
+    if let Some(out) = meta_get(&ctx.conn, "autoexport").ok().flatten().filter(|s| !s.is_empty()) {
+        if let Err(e) = view::refresh(&ctx.path, None, ctx.central, Path::new(&out)) {
+            eprintln!("bl: auto-export to {} failed: {}", out, e);
+        }
+    }
+}
+
+/// The page `bl open` launches for a scope: the snapshot already kept in sync
+/// for it, else a default inside the store's `view/` directory, registered as
+/// the scope's auto-export path now so it stays current from here on.
+fn board_target(ctx: &Ctx, project: Option<&Project>) -> Result<PathBuf> {
+    let dir = if ctx.central {
+        store::home().join("view")
+    } else {
+        ctx.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+            .join("view")
+    };
+    match project {
+        Some(p) => {
+            if !p.autoexport.is_empty() {
+                return Ok(PathBuf::from(&p.autoexport));
+            }
+            let safe: String = p
+                .name
+                .chars()
+                .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+                .collect();
+            let out = dir.join(safe).join("index.html");
+            store::set_autoexport(&ctx.conn, p.id, &out.display().to_string())?;
+            eprintln!("auto-export on → {}  (project {})", out.display(), p.name);
+            Ok(out)
+        }
+        None => {
+            if let Some(g) = meta_get(&ctx.conn, "autoexport")?.filter(|s| !s.is_empty()) {
+                return Ok(PathBuf::from(g));
+            }
+            let out = dir.join("index.html");
+            meta_set(&ctx.conn, "autoexport", &out.display().to_string())?;
+            eprintln!("auto-export on → {}", out.display());
+            Ok(out)
         }
     }
 }
@@ -2092,6 +2187,8 @@ struct ProjectRow {
     project: Project,
     open: i64,
     total: i64,
+    /// Left off the store-wide board page by `bl project hide`.
+    hidden_on_board: bool,
 }
 
 fn project_cmd(ctx: &Ctx, action: ProjectAction) -> Result<()> {
@@ -2116,10 +2213,12 @@ fn project_cmd(ctx: &Ctx, action: ProjectAction) -> Result<()> {
 
         ProjectAction::List { json } => {
             let mut rows = Vec::new();
+            let hidden = store::board_hidden(conn);
             for p in store::all(conn)? {
                 let open = store::open_card_count(conn, p.id)?;
                 let total = store::card_count(conn, p.id)?;
-                rows.push(ProjectRow { project: p, open, total });
+                let hidden_on_board = hidden.contains(&p.id);
+                rows.push(ProjectRow { project: p, open, total, hidden_on_board });
             }
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -2142,6 +2241,9 @@ fn project_cmd(ctx: &Ctx, action: ProjectAction) -> Result<()> {
                         r.project.path,
                         if here { "  (here)" } else { "" }
                     );
+                    if r.hidden_on_board {
+                        println!("       hidden from the store-wide board (bl project unhide {})", r.project.name);
+                    }
                 }
             }
         }
@@ -2183,6 +2285,9 @@ fn project_cmd(ctx: &Ctx, action: ProjectAction) -> Result<()> {
             store::set_active(conn, p.id, false)?;
             println!("project '{}' inactive: skipped by bl next, hidden from the default views", p.name);
         }
+
+        ProjectAction::Hide { names } => set_board_hidden(ctx, &names, true)?,
+        ProjectAction::Unhide { names } => set_board_hidden(ctx, &names, false)?,
 
         ProjectAction::Remove { name, force } => {
             let p = store::lookup(conn, &name)?
@@ -3337,6 +3442,41 @@ fn main() -> Result<()> {
             if open {
                 let abs = out.canonicalize().unwrap_or(out);
                 view::open_in_browser(&abs.display().to_string());
+            }
+        }
+
+        Commands::Open { what, print } => {
+            // A bare number is a card and its project's board is the one to
+            // open; anything else names a project. Nothing given: this one.
+            let mut card = None;
+            let mut project = ctx.project.clone().filter(|_| !ctx.all);
+            match what.as_deref() {
+                Some(w) if w.parse::<i64>().is_ok() => {
+                    let id: i64 = w.parse().unwrap();
+                    let pid = card_project(conn, id)
+                        .ok_or_else(|| anyhow::anyhow!("card #{id} not found"))?;
+                    card = Some(id);
+                    project = store::by_id(conn, pid)?;
+                }
+                Some(w) => {
+                    project = Some(
+                        store::lookup(conn, w)?
+                            .ok_or_else(|| anyhow::anyhow!("no project named '{w}' (bl project list)"))?,
+                    );
+                }
+                None => {}
+            }
+            let target = board_target(&ctx, project.as_ref())?;
+            // Written now, so the page is current even if auto-export was off
+            // or the file had never been made.
+            view::refresh(&ctx.path, project.as_ref().map(|p| p.id), ctx.central, &target)?;
+            let mut url = format!("file://{}", target.display());
+            if let Some(id) = card {
+                url.push_str(&format!("#card-{id}"));
+            }
+            println!("{url}");
+            if !print {
+                view::open_in_browser(&url);
             }
         }
 
