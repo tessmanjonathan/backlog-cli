@@ -9,6 +9,7 @@ Single-binary SQLite backlog. Designed for autonomous agent loops.
 tar -xzf bl-cli.tar.gz
 cd backlog-cli
 cargo build --release
+cargo test                      # end-to-end tests in tests/cli.rs
 cp target/release/bl ~/bin/bl   # or /usr/local/bin/bl
 
 # once: create the central store under ~/.bl and register this repository
